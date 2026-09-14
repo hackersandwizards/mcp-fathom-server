@@ -19,13 +19,21 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+// A client that cached this tool's schema before include_summary existed sends it as a plain
+// string ("true"/"false") rather than a JSON boolean; accept both instead of hard-failing.
+const booleanish = z.preprocess(
+  (value) => (typeof value === 'string' ? value === 'true' : value),
+  z.boolean()
+);
+
 const ListMeetingsSchema = z.object({
   calendar_invitees: z.array(z.string()).optional().describe("Filter by attendee email addresses"),
   calendar_invitees_domains: z.array(z.string()).optional().describe("Filter by company domains"),
   created_after: z.string().optional().describe("Filter meetings created after this date (ISO 8601)"),
   created_before: z.string().optional().describe("Filter meetings created before this date (ISO 8601)"),
+  include_summary: booleanish.optional().default(false).describe("Include each meeting's summary in the response"),
   include_transcript: z.boolean().optional().default(false).describe("Include meeting transcripts"),
-  meeting_type: z.enum(['all', 'internal', 'external']).optional().default('all').describe("Filter by meeting type"),
+  meeting_type: z.string().optional().describe("Filter by a custom meeting type name configured in Fathom (see the /meeting_types endpoint); omit to include every type"),
   recorded_by: z.array(z.string()).optional().describe("Filter by meeting owner email addresses"),
   teams: z.array(z.string()).optional().describe("Filter by team names"),
   limit: z.number().optional().default(50).describe("Maximum number of meetings to return")
@@ -33,6 +41,7 @@ const ListMeetingsSchema = z.object({
 
 const SearchMeetingsSchema = z.object({
   search_term: z.string().describe("Search term to find in meeting titles, summaries, or action items"),
+  include_summary: booleanish.optional().default(false).describe("Include each meeting's summary in the response"),
   include_transcript: z.boolean().optional().default(false).describe("Whether to search within transcripts (WARNING: Currently disabled for performance)")
 });
 
@@ -66,7 +75,7 @@ server.setRequestHandler(ListToolsRequestSchema, async (request: ListToolsReques
     },
     {
       name: "search_meetings",
-      description: "Search for meetings containing keywords in titles, summaries, or action items. NOTE: Searches last 30 days only. For better performance, transcript search is disabled by default.",
+      description: "Search for meetings containing keywords in titles, summaries, or action items. NOTE: Searches last 30 days only, paged up to 5 API pages (response sets truncated: true if more remain). For better performance, transcript search is disabled by default.",
       inputSchema: zodToJsonSchema(SearchMeetingsSchema)
     }
   ]
@@ -123,9 +132,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       const params = SearchMeetingsSchema.parse(args);
       
       console.error(`[search_meetings] Searching for: "${params.search_term}" (transcript=${params.include_transcript})`);
-      const meetings = await fathomClient.searchMeetings(
-        params.search_term, 
-        params.include_transcript
+      const { meetings, truncated } = await fathomClient.searchMeetings(
+        params.search_term,
+        params.include_transcript,
+        params.include_summary
       );
       console.error(`[search_meetings] Found ${meetings.length} matching meetings`);
       
@@ -148,7 +158,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           text: JSON.stringify({
             search_term: params.search_term,
             total_found: meetings.length,
-            meetings: formattedMeetings
+            meetings: formattedMeetings,
+            truncated
           }, null, 2)
         }]
       };

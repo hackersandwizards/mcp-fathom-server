@@ -33,26 +33,52 @@ export class FathomClient {
     }
   }
 
-  async searchMeetings(searchTerm: string, includeTranscript: boolean = false): Promise<FathomMeeting[]> {
-    // For now, just get recent meetings without transcripts for performance
-    // Transcripts can make responses over 1MB which is too slow
-    const response = await this.listMeetings({
-      include_transcript: false,
-      created_after: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString() // Last 30 days
-    });
-    
+  // Fathom returns one page per call; a 30-day window can hold more meetings than one page.
+  // Follow next_cursor up to this many pages before giving up and reporting truncation instead
+  // of silently dropping the rest.
+  private static readonly MAX_SEARCH_PAGES = 5;
+
+  async searchMeetings(
+    searchTerm: string,
+    includeTranscript: boolean = false,
+    includeSummary: boolean = false
+  ): Promise<{ meetings: FathomMeeting[]; truncated: boolean }> {
+    const createdAfter = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(); // Last 30 days
+    const allItems: FathomMeeting[] = [];
+    let cursor: string | undefined;
+    let truncated = false;
+
+    for (let page = 0; page < FathomClient.MAX_SEARCH_PAGES; page++) {
+      const response = await this.listMeetings({
+        include_transcript: false,
+        include_summary: includeSummary,
+        created_after: createdAfter,
+        cursor
+      });
+      allItems.push(...response.items);
+
+      if (!response.next_cursor) {
+        cursor = undefined;
+        break;
+      }
+      cursor = response.next_cursor;
+      if (page === FathomClient.MAX_SEARCH_PAGES - 1) {
+        truncated = true;
+      }
+    }
+
     const searchLower = searchTerm.toLowerCase();
-    const filteredMeetings = response.items.filter(meeting => {
-      const titleMatch = meeting.title?.toLowerCase().includes(searchLower) || 
+    const filteredMeetings = allItems.filter(meeting => {
+      const titleMatch = meeting.title?.toLowerCase().includes(searchLower) ||
                         meeting.meeting_title?.toLowerCase().includes(searchLower);
-      const summaryMatch = meeting.default_summary?.toLowerCase().includes(searchLower);
-      const actionItemsMatch = meeting.action_items?.some(item => 
+      const summaryMatch = meeting.default_summary?.markdown_formatted?.toLowerCase().includes(searchLower);
+      const actionItemsMatch = meeting.action_items?.some(item =>
         typeof item === 'string' && item.toLowerCase().includes(searchLower)
       );
-      
+
       return titleMatch || summaryMatch || actionItemsMatch;
     });
-    
+
     // If we need transcripts, fetch them individually for just the matching meetings
     if (includeTranscript && filteredMeetings.length > 0 && filteredMeetings.length <= 5) {
       // Only fetch transcripts for up to 5 meetings to avoid timeouts
@@ -60,8 +86,8 @@ export class FathomClient {
       // Note: This would require individual meeting fetch API which Fathom doesn't seem to provide
       // So we'll return without transcripts for now
     }
-    
-    return filteredMeetings;
+
+    return { meetings: filteredMeetings, truncated };
   }
 
   private formatParams(params?: FathomListMeetingsParams): Record<string, any> {

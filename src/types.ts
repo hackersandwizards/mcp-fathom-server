@@ -1,3 +1,8 @@
+export interface FathomMeetingSummary {
+  template_name?: string;
+  markdown_formatted: string;
+}
+
 export interface FathomMeeting {
   title: string;
   meeting_title: string;
@@ -8,12 +13,12 @@ export interface FathomMeeting {
   scheduled_end_time?: string;
   recording_start_time?: string;
   recording_end_time?: string;
-  meeting_type: 'all' | 'internal' | 'external';
+  meeting_type: string;
   transcript_language?: string;
   calendar_invitees: string[];
   recorded_by: string;
   transcript?: string;
-  default_summary?: string;
+  default_summary?: FathomMeetingSummary;
   action_items?: string[];
   crm_matches?: any[];
 }
@@ -25,8 +30,9 @@ export interface FathomListMeetingsParams {
   created_before?: string;
   cursor?: string;
   include_crm_matches?: boolean;
+  include_summary?: boolean;
   include_transcript?: boolean;
-  meeting_type?: 'all' | 'internal' | 'external';
+  meeting_type?: string;
   recorded_by?: string[];
   teams?: string[];
 }
