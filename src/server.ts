@@ -9,6 +9,7 @@ import {
   meetingDate,
   meetingUrl,
   peopleOf,
+  type Person,
   SEARCH_FIELDS,
   dateRangeBounds,
   formatMeeting,
@@ -218,7 +219,7 @@ export function createServer(client: FathomClient): McpServer {
         'Resolve a pasted Fathom link (fathom.video/calls/<id> or fathom.video/share/<token>) or a bare call ID to its meeting, including recording_id and the public share URL. Scans the most recent meetings, 10 per request.',
       inputSchema: z.object({
         link: z.string().trim().min(1).describe('A fathom.video/calls/ or /share/ URL, or the numeric call ID from a /calls/ URL'),
-        max_scan: z.number().int().min(10).max(1000).default(300).describe('Recent meetings to scan')
+        max_scan: z.number().int().min(10).max(500).default(300).describe('Recent meetings to scan, 10 per request')
       }),
       annotations: READ
     },
@@ -232,9 +233,9 @@ export function createServer(client: FathomClient): McpServer {
         return !!found || Date.now() > deadline;
       });
       if (found) return json(formatMeeting(found, { detailed: true }));
-      const stopped = scan.error ?? (Date.now() > deadline ? 'time limit reached' : undefined);
+      const stopped = scan.error ?? (scan.next_cursor && Date.now() > deadline ? 'time limit reached' : undefined);
       return fail(
-        `No meeting with this link among the ${scan.items.length} most recent meetings.${stopped ? ` Scan stopped early: ${stopped}.` : ''} Raise max_scan, or ask the user for the meeting date and use list_meetings with created_after and created_before.`
+        `No meeting with this link among the ${scan.items.length} most recent meetings.${stopped ? ` Scan stopped early: ${stopped.replace(/\.$/, '')}.` : ''} Raise max_scan, or ask the user for the meeting date and use list_meetings with created_after and created_before.`
       );
     }
   );
@@ -336,15 +337,19 @@ export function createServer(client: FathomClient): McpServer {
         return [];
       });
 
+      // Newest first, so the first meeting seen for a person is their latest. Speakers are read page
+      // by page and the transcripts dropped, so memory holds one page of them at a time.
+      const seen: Array<{ meeting: Meeting; p: Person }> = [];
       const scan = await client
-        // Transcripts name the speakers.
-        .listMeetings({ include_transcript: true }, max_scan, undefined, () => Date.now() > deadline)
-        .catch((error: Error) => ({ items: [] as Meeting[], error: error.message }));
-      const stopped = scan.error ?? (scan.items.length < max_scan && Date.now() > deadline ? 'time limit reached' : undefined);
+        .listMeetings({ include_transcript: true }, max_scan, undefined, meeting => {
+          for (const p of peopleOf(meeting)) seen.push({ meeting, p });
+          meeting.transcript = null;
+          return Date.now() > deadline;
+        })
+        .catch((error: Error) => ({ items: [] as Meeting[], next_cursor: null, error: error.message }));
+      const stopped = scan.error ?? (scan.next_cursor && Date.now() > deadline ? 'time limit reached' : undefined);
 
-      const members = (await roster).filter(m => anyIncludes([m.name, m.email], name));
-      // Newest first, so the first meeting seen for a person is their latest.
-      const seen = scan.items.flatMap(meeting => peopleOf(meeting).filter(p => anyIncludes([p.name, p.email, ...(p.aliases ?? [])], name)).map(p => ({ meeting, p })));
+      const members = await roster;
       // A name shown without an email, such as an unmatched speaker, joins the one email seen with that name.
       const emailByName = new Map<string, string | null>();
       const named = [...members.map(m => ({ names: [m.name], email: m.email })), ...seen.map(({ p }) => ({ names: [p.name, ...(p.aliases ?? [])], email: p.email }))];
@@ -357,24 +362,34 @@ export function createServer(client: FathomClient): McpServer {
       }
       const keyOf = (email: string | null, n: string | null) => (email || (n && emailByName.get(n.toLowerCase())) || n || '').toLowerCase();
 
-      const people = new Map<string, Record<string, unknown> & { meetings: number; spoke_in: number }>();
-      for (const m of members) people.set(keyOf(m.email, m.name), { name: m.name, email: m.email, team_member: true, meetings: 0, spoke_in: 0 });
-      // Two entries of one meeting can resolve to the same person, so each meeting counts once.
-      const counted = new Map<string, { id: number; spoke: boolean }>();
+      // Everyone is grouped first and matched after, so a query for an email also finds the meetings
+      // where that person spoke under a name only.
+      type Entry = { name: string | null; email: string | null; team_member?: true; external?: boolean; names: string[]; meetings: Set<number>; spoke: Set<number>; latest?: Meeting };
+      const people = new Map<string, Entry>();
+      const entry = (key: string, name: string | null, email: string | null) => {
+        const known = people.get(key) ?? { name, email, names: [], meetings: new Set<number>(), spoke: new Set<number>() };
+        people.set(key, known);
+        return known;
+      };
+      for (const m of members) Object.assign(entry(keyOf(m.email, m.name), m.name, m.email), { team_member: true, names: [m.name] });
       for (const { meeting, p } of seen) {
-        const key = keyOf(p.email, p.name);
-        const person = people.get(key) ?? { name: p.name, email: p.email, meetings: 0, spoke_in: 0 };
+        const person = entry(keyOf(p.email, p.name), p.name, p.email);
         person.email ||= p.email;
         person.external ??= p.external ?? undefined;
-        const last = counted.get(key);
-        const again = last?.id === meeting.recording_id;
-        if (!again) person.meetings += 1;
-        if (p.spoke && !(again && last.spoke)) person.spoke_in += 1;
-        counted.set(key, { id: meeting.recording_id, spoke: p.spoke || (again && last.spoke) });
-        person.latest_meeting ??= { recording_id: meeting.recording_id, title: meeting.title || meeting.meeting_title, date: meetingDate(meeting), url: meetingUrl(meeting) };
-        people.set(key, person);
+        person.names.push(...[p.name, ...(p.aliases ?? [])].filter((n): n is string => !!n));
+        person.meetings.add(meeting.recording_id);
+        if (p.spoke) person.spoke.add(meeting.recording_id);
+        person.latest ??= meeting;
       }
-      const matches = [...people.values()].sort((a, b) => b.meetings - a.meetings);
+      const matches = [...people.values()]
+        .filter(p => anyIncludes([p.email, ...p.names], name))
+        .sort((a, b) => b.meetings.size - a.meetings.size)
+        .map(({ names: _, meetings, spoke, latest, ...p }) => ({
+          ...p,
+          meetings: meetings.size,
+          spoke_in: spoke.size,
+          ...(latest ? { latest_meeting: { recording_id: latest.recording_id, title: latest.title || latest.meeting_title, date: meetingDate(latest), url: meetingUrl(latest) } } : {})
+        }));
       return json({
         matches: matches.slice(0, 25),
         ...(matches.length > 25 ? { note: `${matches.length - 25} more people match. Use a longer name fragment.` } : {}),

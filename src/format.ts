@@ -50,7 +50,7 @@ export function formatTranscriptLine(entry: TranscriptEntry, url?: string): stri
   return `${stamp} ${entry.speaker.display_name}: ${entry.text}`;
 }
 
-export const meetingUrl = (meeting: Pick<Meeting, 'url' | 'share_url'>) => meeting.share_url || meeting.url;
+export const meetingUrl = (meeting: Meeting) => meeting.share_url || meeting.url;
 export const meetingDate = (meeting: Meeting) => meeting.scheduled_start_time || meeting.created_at;
 
 export interface FormatOptions {
@@ -178,7 +178,6 @@ export interface Person {
   name: string | null;
   email: string | null;
   external: boolean | null;
-  invited: boolean;
   spoke: boolean;
   /** Other names Fathom shows for this person, such as the speaker name matched to an invitee. */
   aliases?: string[];
@@ -203,7 +202,7 @@ export function peopleOf(meeting: Meeting): Person[] {
   // Fathom links a speaker to an invitee by display name; unmatched speakers carry no email.
   const inviteeBySpeaker = new Map<string, string>();
   const add = (key: string, name: string | null, email: string | null, patch: Partial<Person>) => {
-    const person = people.get(key) ?? { name, email, external: null, invited: false, spoke: false };
+    const person = people.get(key) ?? { name, email, external: null, spoke: false };
     // Fathom sometimes shows an invitee's email as their name; a real name seen later wins.
     const better = !person.name || (person.name.includes('@') && !!name && !name.includes('@'));
     const merged = { ...person, name: better ? name : person.name, email: person.email || email, ...patch };
@@ -215,12 +214,13 @@ export function peopleOf(meeting: Meeting): Person[] {
   for (const invitee of meeting.calendar_invitees ?? []) {
     const key = (invitee.email || invitee.name || invitee.matched_speaker_display_name || '').toLowerCase();
     if (!key) continue;
-    add(key, invitee.name || invitee.matched_speaker_display_name, invitee.email, { external: invitee.is_external, invited: true });
+    add(key, invitee.name || invitee.matched_speaker_display_name, invitee.email, { external: invitee.is_external });
     if (invitee.matched_speaker_display_name) add(key, invitee.matched_speaker_display_name, null, {});
     for (const alias of [invitee.matched_speaker_display_name, invitee.name]) if (alias) inviteeBySpeaker.set(alias.toLowerCase(), key);
   }
-  for (const { speaker } of meeting.transcript ?? []) {
-    if (!speaker) continue;
+  // One entry per distinct speaker, not per transcript line.
+  const speakers = new Map((meeting.transcript ?? []).filter(e => e.speaker).map(({ speaker }) => [`${speaker.display_name}|${speaker.matched_calendar_invitee_email}`, speaker]));
+  for (const speaker of speakers.values()) {
     const byName = speaker.display_name?.toLowerCase();
     const key = speaker.matched_calendar_invitee_email?.toLowerCase() || (byName && inviteeBySpeaker.get(byName)) || byName;
     if (key) add(key, speaker.display_name, speaker.matched_calendar_invitee_email, { spoke: true });

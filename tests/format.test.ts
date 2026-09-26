@@ -59,8 +59,8 @@ describe('format', () => {
       transcript: [speaker('Alice S.'), speaker('Bob')]
     });
     assert.deepEqual(peopleOf(m), [
-      { name: 'Alice Smith', email: 'alice@x.com', external: true, invited: true, spoke: true, aliases: ['Alice S.'] },
-      { name: 'Bob', email: null, external: null, invited: false, spoke: true }
+      { name: 'Alice Smith', email: 'alice@x.com', external: true, spoke: true, aliases: ['Alice S.'] },
+      { name: 'Bob', email: null, external: null, spoke: true }
     ]);
   });
 
@@ -69,6 +69,6 @@ describe('format', () => {
       calendar_invitees: [{ name: 'nb@x.com', email: 'nb@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: 'Niklas B' }],
       transcript: [speaker('Niklas B')]
     });
-    assert.deepEqual(peopleOf(m)[0], { name: 'Niklas B', email: 'nb@x.com', external: true, invited: true, spoke: true, aliases: ['nb@x.com'] });
+    assert.deepEqual(peopleOf(m)[0], { name: 'Niklas B', email: 'nb@x.com', external: true, spoke: true, aliases: ['nb@x.com'] });
   });
 });

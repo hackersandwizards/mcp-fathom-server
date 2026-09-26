@@ -201,6 +201,11 @@ describe('MCP server', () => {
       meeting(1, { calendar_invitees: [{ name: 'Anna Schmidt', email: 'anna@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: null }] })
     ], 'anna');
     assert.deepEqual(anna.map((m: { email: string; meetings: number }) => [m.email, m.meetings]), [['anna@x.com', 2]]);
+    const byEmail = await findPerson([
+      meeting(2, { transcript: [speaker('Anna Schmidt')] }),
+      meeting(1, { calendar_invitees: [{ name: 'Anna Schmidt', email: 'anna@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: null }] })
+    ], 'anna@x.com');
+    assert.deepEqual(byEmail.map((m: { meetings: number; spoke_in: number }) => [m.meetings, m.spoke_in]), [[2, 1]], 'a query by email finds the meeting where she only spoke');
     const bob = await findPerson([
       meeting(2, { transcript: [speaker('Bob Smith')] }),
       meeting(1, { calendar_invitees: [{ name: 'bob@x.com', email: 'bob@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: 'Bob Smith' }] })
