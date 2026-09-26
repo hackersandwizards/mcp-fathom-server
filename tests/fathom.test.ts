@@ -117,4 +117,12 @@ describe('FathomClient errors and retries', () => {
     await assert.rejects(client.listTeams(), /after 0 retries, and Fathom asks to wait 45 s/);
     assert.equal(calls.length, 1);
   });
+
+  it('keeps earlier pages when a later page has an empty body', async () => {
+    const pages = pagedMeetings(Array.from({ length: 20 }, (_, i) => meeting(i + 1)));
+    const { client } = fakeApi(url => (url.searchParams.get('cursor') ? new Response('', { status: 200 }) : pages(url)));
+    const result = await client.listMeetings({}, 20);
+    assert.equal(result.items.length, 10);
+    assert.match(result.error!, /without items/);
+  });
 });

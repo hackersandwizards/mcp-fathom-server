@@ -174,7 +174,8 @@ export class FathomClient {
     const started = Date.now();
     const canWait = (ms: number) => Date.now() - started + ms + REQUEST_TIMEOUT_MS <= REQUEST_BUDGET_MS;
     let networkFailures = 0;
-    for (let attempt = 0; ; attempt++) {
+    let retries = 0;
+    for (;;) {
       let response: Response;
       let raw: string;
       try {
@@ -197,14 +198,15 @@ export class FathomClient {
 
       const retryable = response.status === 429 || (method === 'GET' && response.status >= 500);
       const retryAfter = Number(response.headers.get('retry-after'));
-      const wait = retryAfter > 0 ? retryAfter * 1000 : 1000 * 2 ** attempt;
-      if (retryable && attempt < MAX_RETRIES && wait <= MAX_RETRY_WAIT_MS && canWait(wait)) {
+      const wait = retryAfter > 0 ? retryAfter * 1000 : 1000 * 2 ** retries;
+      if (retryable && retries < MAX_RETRIES && wait <= MAX_RETRY_WAIT_MS && canWait(wait)) {
         console.error(`[fathom] ${response.status} on ${path}, retrying in ${wait} ms`);
+        retries++;
         await this.sleep(wait);
         continue;
       }
 
-      if (!response.ok) throw toError(response.status, raw, path, attempt, retryAfter);
+      if (!response.ok) throw toError(response.status, raw, path, retries, retryAfter);
       if (!raw) return undefined as T;
       try {
         return JSON.parse(raw) as T;
@@ -233,6 +235,7 @@ export class FathomClient {
       let page: Page<T>;
       try {
         page = await this.request<Page<T>>('GET', path, { ...query, cursor: c });
+        if (!Array.isArray(page?.items)) throw new FathomApiError(`Fathom returned a page without items on ${path}.`);
       } catch (error) {
         if (!items.length) throw error;
         return { items, next_cursor: encodeCursor({ c, s }), error: (error as Error).message };

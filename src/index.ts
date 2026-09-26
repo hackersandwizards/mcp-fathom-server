@@ -3,12 +3,6 @@ import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { FathomClient } from './fathom.js';
 import { createServer } from './server.js';
 
-try {
-  process.loadEnvFile();
-} catch (error) {
-  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-}
-
 const apiKey = process.env.FATHOM_API_KEY;
 if (!apiKey) {
   console.error('FATHOM_API_KEY is not set. Put it in the env block of your MCP client config, see README.md.');

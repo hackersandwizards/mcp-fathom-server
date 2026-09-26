@@ -11,12 +11,12 @@
     "dist"
   ],
   "engines": {
-    "node": ">=20.12"
+    "node": ">=20"
   },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
+    "dev": "node --env-file=.env --import tsx src/index.ts",
     "test": "node --import tsx --test tests/*.test.ts",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
   },

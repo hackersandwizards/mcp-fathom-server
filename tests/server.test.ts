@@ -159,4 +159,16 @@ describe('MCP server', () => {
     assert.equal(body.matches[0].email, 'jane@x.com');
     assert.match(body.error, /403/);
   });
+
+  it('does not cache an empty transcript', async () => {
+    const { client, calls } = await connect(() => ({ transcript: [] }));
+    for (let i = 0; i < 2; i++) await client.callTool({ name: 'get_meeting_transcript', arguments: { recording_id: 1 } });
+    assert.equal(calls.length, 2);
+  });
+
+  it('refuses a non-web transcript url', async () => {
+    const { client } = await connect(() => ({ transcript: [] }));
+    const result = await client.callTool({ name: 'get_meeting_transcript', arguments: { recording_id: 1, url: 'javascript:alert(1)' } });
+    assert.equal(result.isError, true);
+  });
 });

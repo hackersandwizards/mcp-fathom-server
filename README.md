@@ -32,7 +32,7 @@ Every read tool is marked read-only, so clients can run it without asking. `dele
 
 ## Setup
 
-You need Node.js 20.12 or later and a Fathom API key from the API Access section of your [Fathom user settings](https://fathom.video/customize#api-access-header).
+You need Node.js 20 or later and a Fathom API key from the API Access section of your [Fathom user settings](https://fathom.video/customize#api-access-header).
 
 ```bash
 git clone https://github.com/hackersandwizards/mcp-fathom-server.git
@@ -66,10 +66,10 @@ Claude Desktop: add this to `~/Library/Application Support/Claude/claude_desktop
 ```bash
 npm test          # unit and in-process MCP tests, no network
 npm run dev       # runs from source, reads FATHOM_API_KEY from .env
-npm run inspect   # MCP Inspector against the build, reads .env
+npm run inspect   # MCP Inspector against the build
 ```
 
-Copy `.env.example` to `.env` for the two commands that read it.
+Copy `.env.example` to `.env` for `npm run dev`. The server itself reads only its environment, never a `.env` file, so a project's `.env` cannot change it. In the Inspector, set `FATHOM_API_KEY` under Environment Variables.
 
 ## License
 

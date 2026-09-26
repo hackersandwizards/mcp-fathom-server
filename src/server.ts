@@ -103,9 +103,11 @@ export function createServer(client: FathomClient): McpServer {
   const transcriptOf = (id: number) => {
     if (lastTranscript?.id !== id || Date.now() - lastTranscript.at > TRANSCRIPT_CACHE_MS) {
       const entries = client.getTranscript(id);
-      entries.catch(() => {
+      // A failed or empty download is not kept: an empty transcript may still be processing.
+      const forget = () => {
         if (lastTranscript?.entries === entries) lastTranscript = undefined;
-      });
+      };
+      entries.then(list => list.length || forget(), forget);
       lastTranscript = { id, at: Date.now(), entries };
     }
     return lastTranscript.entries;
@@ -199,7 +201,6 @@ export function createServer(client: FathomClient): McpServer {
 
       const oldest = scan.items.at(-1);
       return json({
-        total_matches: matches.length,
         meetings: matches,
         scanned: scan.items.length,
         oldest_scanned_created_at: oldest ? oldest.created_at : null,
@@ -232,7 +233,7 @@ export function createServer(client: FathomClient): McpServer {
         'Get a meeting transcript, one line per speaker turn: "[MM:SS] Speaker: text". Pass the meeting url from list_meetings to turn each timestamp into a link to that moment. Long transcripts are paged with start and max_entries.',
       inputSchema: z.object({
         recording_id: recordingId,
-        url: z.string().url().optional().describe('The meeting url from list_meetings or search_meetings'),
+        url: z.url({ protocol: /^https?$/ }).optional().describe('The meeting url from list_meetings or search_meetings'),
         start: z.number().int().min(0).default(0).describe('Index of the first entry to return'),
         max_entries: z.number().int().min(1).max(5000).default(1000).describe('Entries to return')
       }),
@@ -269,7 +270,7 @@ export function createServer(client: FathomClient): McpServer {
       annotations: READ
     },
     async ({ team }) => {
-      const members = await client.listTeamMembers(team);
+      const members = await client.listTeamMembers(team, Date.now() + SCAN_BUDGET_MS);
       return json({ count: members.length, members: members.map(m => ({ name: m.name, email: m.email })) });
     }
   );
@@ -330,7 +331,7 @@ export function createServer(client: FathomClient): McpServer {
             source: 'invitee',
             meetings: 0
           };
-          person.external = invitee.is_external;
+          person.external ??= invitee.is_external;
           person.meetings += 1;
           // Meetings arrive newest first, so the first one seen is the latest.
           person.latest_meeting ??= { recording_id: meeting.recording_id, title: meeting.title, date: meetingDate(meeting) };
@@ -426,7 +427,7 @@ export function createServer(client: FathomClient): McpServer {
           role: 'user' as const,
           content: {
             type: 'text' as const,
-            text: `Prepare me for my next meeting with ${who}. Use search_meetings (attendee, or calendar_invitees_domains for a domain) over the last 90 days with include_summary and include_action_items. Brief me on: what we discussed, what was decided, open action items and who owns them, and open questions. Link each point to its meeting.`
+            text: `Prepare me for my next meeting with ${who}. For a person use search_meetings with attendee, for a company domain use list_meetings with calendar_invitees_domains, both over date_range last_90_days with include_summary and include_action_items. Brief me on: what we discussed, what was decided, open action items and who owns them, and open questions. Link each point to its meeting.`
           }
         }
       ]
