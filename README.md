@@ -37,7 +37,7 @@ The Fathom API has no speaker index and no link lookup. So the server builds its
 ## Limits of the Fathom API
 
 - Fathom has no search endpoint. `search_meetings` scans meetings 10 per request and matches locally. The API allows 60 requests per minute, and 30 or fewer for summaries and transcripts, so a scan of 100 meetings takes 10 requests. The server waits and retries when Fathom answers with a rate limit.
-- The API key sees the meetings its user recorded or that were shared with that user or their team.
+- The API key sees the meetings its user recorded or that were shared with that user or their team. Meetings recorded by someone outside your organisation and shared with you are the exception: the API never lists them, so no search, `find_person` or `find_meeting_by_link` result includes them, although `get_meeting_summary` and `get_meeting_transcript` read them by `recording_id` (checked 2026-09-26).
 - Fathom cannot filter by a single attendee. `search_meetings` filters attendees locally.
 - Fathom has no endpoint to list webhooks, and shows a webhook's secret only once. `create_webhook` returns both, so store them.
 - The ID in a `fathom.video/calls/<id>` link is not the `recording_id` the API uses, and the API has no lookup. `find_meeting_by_link` uses the local index instead.
