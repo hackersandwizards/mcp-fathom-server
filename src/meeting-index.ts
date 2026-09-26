@@ -58,6 +58,8 @@ interface State {
   complete: boolean;
   /** A walk is under way. A re-walk keeps the index complete while it runs. */
   walking?: boolean;
+  /** The last walk would have deleted more than half the index, so this walk checks it. */
+  confirming_sweep?: boolean;
   completed_at?: string;
   walk?: number;
   forward_synced_at?: string;
@@ -108,6 +110,7 @@ export function peopleOf(meeting: Meeting): IndexedPerson[] {
     for (const alias of [invitee.matched_speaker_display_name, invitee.name]) if (alias) inviteeBySpeaker.set(alias.toLowerCase(), key);
   }
   for (const { speaker } of meeting.transcript ?? []) {
+    if (!speaker) continue;
     const byName = speaker.display_name?.toLowerCase();
     const key = speaker.matched_calendar_invitee_email?.toLowerCase() || (byName && inviteeBySpeaker.get(byName)) || byName;
     if (key) add(key, speaker.display_name, speaker.matched_calendar_invitee_email, { spoke: true });
@@ -143,7 +146,6 @@ export class MeetingIndex {
   private loadedMtime = 0;
   private pagesSinceSave = 0;
   private freshAt = 0;
-  private walkFromTop = false;
   private missAt = 0;
   private cursorRejections = 0;
   private exitHooked = false;
@@ -240,18 +242,19 @@ export class MeetingIndex {
     return next;
   }
 
-  /** `withTranscripts`: the listing asked for transcripts, so a missing one is retried next walk. */
-  private add(meetings: Meeting[], withTranscripts: boolean): void {
+  /**
+   * A meeting listed without its transcript keeps the speakers found earlier. A new one is marked,
+   * so a later listing with transcripts reads its speakers.
+   */
+  private add(meetings: Meeting[]): void {
     const walk = this.state.walk ?? 0;
     for (const m of meetings) {
-      const indexed = { ...toIndexed(m), walk };
-      // A listing without transcripts keeps the speakers found earlier.
+      const indexed: IndexedMeeting = { ...toIndexed(m), walk };
       const known = this.state.meetings[m.recording_id];
-      if (!m.transcript && known) {
-        indexed.people = known.people;
-        if (known.speakers_missing) indexed.speakers_missing = true;
+      if (!m.transcript) {
+        if (known) indexed.people = known.people;
+        if (!known || known.speakers_missing) indexed.speakers_missing = true;
       }
-      if ((withTranscripts || !known) && !m.transcript) indexed.speakers_missing = true;
       this.state.meetings[m.recording_id] = indexed;
     }
     if (meetings.length) this.sorted = this.byLink = null;
@@ -282,27 +285,28 @@ export class MeetingIndex {
     await this.heartbeat();
     if (!this.writer) return;
     const cursor = this.state.backfill_cursor ?? undefined;
-    if (!cursor) this.walkFromTop = true;
     // A re-walk only learns which meetings exist. It re-reads a page with transcripts only when the
     // page holds a new meeting or one whose speakers are missing, like one page of the first build.
     const rewalk = this.state.complete;
     const page = await this.client.listMeetings({ include_transcript: !rewalk }, 10, cursor);
-    this.add(page.items, !rewalk);
+    this.add(page.items);
     if (rewalk && page.items.some(m => this.state.meetings[m.recording_id]?.speakers_missing)) {
       const full = await this.client.listMeetings({ include_transcript: true }, 10, cursor).catch(() => null);
-      if (full) this.add(full.items, true);
+      if (full) this.add(full.items);
     }
     if (!cursor && page.items[0]) this.raiseWatermark(page.items[0].created_at);
     this.state.backfill_cursor = page.next_cursor;
     if (!page.next_cursor) {
       const walk = this.state.walk ?? 0;
       const stale = Object.entries(this.state.meetings).filter(([, m]) => (m.walk ?? 0) < walk);
-      // A walk resumed from a saved cursor that ends early, as an expired cursor might, would delete
-      // most of the index. Such a walk starts again from the top instead.
-      if (!this.walkFromTop && stale.length > this.size / 2) {
+      // A walk that ends early, as after an expired cursor, would delete most of the index. Such a
+      // sweep waits for one more walk from the top to agree.
+      if (stale.length > this.size / 2 && !this.state.confirming_sweep) {
+        this.state.confirming_sweep = true;
         this.startWalk();
         return this.save();
       }
+      this.state.confirming_sweep = false;
       // Every visible meeting was seen during this walk; the rest were deleted or unshared.
       for (const [id] of stale) delete this.state.meetings[id];
       this.sorted = this.byLink = null;
@@ -324,9 +328,20 @@ export class MeetingIndex {
     // An empty index is current only once a completed walk found no meetings at all.
     if (!newest && !this.state.complete) return;
     const since = newest && new Date(Date.parse(newest) - overlapMs).toISOString();
-    const page = await this.client.listMeetings({ created_after: since || undefined, include_transcript: true }, Infinity, undefined, () => Date.now() > deadline);
-    const added = page.items.some(m => !this.state.meetings[m.recording_id]);
-    this.add(page.items, true);
+    // The listing without transcripts is cheap. Transcripts are read only for new meetings and
+    // meetings whose speakers are missing, such as ones still processing at the last sync.
+    const list = (include_transcript: boolean) =>
+      this.client.listMeetings({ created_after: since || undefined, include_transcript }, Infinity, undefined, () => Date.now() > deadline);
+    const missing = () => new Set(Object.values(this.state.meetings).filter(m => m.speakers_missing).map(m => m.recording_id));
+    const before = { size: Object.keys(this.state.meetings).length, missing: missing() };
+    let page = await list(false);
+    this.add(page.items);
+    if (!page.error && !page.next_cursor && page.items.some(m => this.state.meetings[m.recording_id].speakers_missing)) {
+      page = await list(true);
+      this.add(page.items);
+    }
+    const after = missing();
+    const changed = Object.keys(this.state.meetings).length !== before.size || [...before.missing].some(id => !after.has(id));
     if (page.error || page.next_cursor) {
       await this.save();
       throw new FathomApiError(page.error ?? 'Stopped at the time limit.', page.status);
@@ -335,14 +350,15 @@ export class MeetingIndex {
     this.freshAt = Date.now();
     // Only the writer's loop reads this time, so it is saved with the next change rather than alone.
     if (background) this.state.forward_synced_at = new Date().toISOString();
-    if (added) await this.save();
+    if (changed) await this.save();
   }
 
   private handleLoopError(error: unknown): 'stop' | 'continue' {
     const message = (error as Error).message;
     const status = error instanceof FathomApiError ? error.status : undefined;
-    // A file system error, such as an unwritable cache directory, does not heal by waiting.
-    if (status === 401 || (error as NodeJS.ErrnoException).code) {
+    // Only API errors can heal by waiting. A file system error, such as an unwritable cache
+    // directory, or a bug would fail the same way every minute.
+    if (status === 401 || !(error instanceof FathomApiError)) {
       console.error(`[index] Stopped: ${message}`);
       return 'stop';
     }

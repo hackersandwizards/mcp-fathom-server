@@ -372,9 +372,10 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
       let scanFilters: MeetingFilters = {};
       if (index) {
         const warning = await index.freshen(Math.min(deadline, Date.now() + FRESHEN_BUDGET_MS));
-        const { complete, oldest_indexed, indexed_meetings } = index.coverage();
+        const indexCoverage = index.coverage();
+        const { complete, oldest_indexed, indexed_meetings } = indexCoverage;
         meetings = index.meetings();
-        coverage = { index: index.coverage(), ...(warning ? { index_warning: warning } : {}) };
+        coverage = { index: indexCoverage, ...(warning ? { index_warning: warning } : {}) };
         // A partial index is topped up with a scan of older meetings, up to max_scan in all.
         toScan = complete ? 0 : Math.max(0, max_scan - indexed_meetings);
         if (oldest_indexed) scanFilters = { created_before: oldest_indexed };

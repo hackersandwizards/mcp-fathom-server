@@ -381,4 +381,18 @@ describe('MeetingIndex', () => {
     assert.equal(matches[0].meetings, 2);
     assert.equal(matches[0].spoke_in, 1);
   });
+
+  it('re-reads the last day without transcripts, and saves speakers it fills in', async () => {
+    const { index, live, calls, path } = await built();
+    const forward = () => (index as unknown as { forward: (d: number, o: number, b: boolean) => Promise<void> }).forward(Infinity, 24 * 3_600_000, true);
+    let before = calls.length;
+    await forward();
+    assert.deepEqual(calls.slice(before).map(c => c.url.searchParams.get('include_transcript')), ['false'], 'nothing missing, one cheap listing');
+    (index as unknown as { state: { meetings: Record<string, { speakers_missing?: true }> } }).state.meetings[1].speakers_missing = true;
+    live[0].transcript = [speaker('Zed Late')];
+    before = calls.length;
+    await forward();
+    assert.deepEqual(calls.slice(before).map(c => c.url.searchParams.get('include_transcript')), ['false', 'true']);
+    assert.match(await readFile(path, 'utf8'), /Zed Late/);
+  });
 });
