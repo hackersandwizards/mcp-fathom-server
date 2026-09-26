@@ -50,7 +50,7 @@ export function formatTranscriptLine(entry: TranscriptEntry, url?: string): stri
   return `${stamp} ${entry.speaker.display_name}: ${entry.text}`;
 }
 
-export const meetingUrl = (meeting: Meeting) => meeting.share_url || meeting.url;
+export const meetingUrl = (meeting: Pick<Meeting, 'url' | 'share_url'>) => meeting.share_url || meeting.url;
 export const meetingDate = (meeting: Meeting) => meeting.scheduled_start_time || meeting.created_at;
 
 export interface FormatOptions {

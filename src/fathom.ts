@@ -228,7 +228,7 @@ export class FathomClient {
     cursor?: string,
     stopAfter?: (item: T) => boolean,
     keyOf?: (item: T) => string | number
-  ): Promise<{ items: T[]; next_cursor: string | null; error?: string }> {
+  ): Promise<{ items: T[]; next_cursor: string | null; error?: string; status?: number }> {
     let { c, s, a } = decodeCursor(cursor);
     const items: T[] = [];
     for (;;) {
@@ -238,7 +238,7 @@ export class FathomClient {
         if (!Array.isArray(page?.items)) throw new FathomApiError(`Fathom returned a page without items on ${path}.`);
       } catch (error) {
         if (!items.length) throw error;
-        return { items, next_cursor: encodeCursor({ c, s }), error: (error as Error).message };
+        return { items, next_cursor: encodeCursor({ c, s }), error: (error as Error).message, status: (error as FathomApiError).status };
       }
       if (a !== undefined && keyOf) {
         const find = (items: T[]) => items.findIndex(item => String(keyOf(item)) === a);
@@ -272,7 +272,7 @@ export class FathomClient {
   /** Every page, or an error: a silently partial list of names would read as complete. */
   private async all<T>(path: string, query: Query = {}, deadline = Infinity): Promise<T[]> {
     const result = await this.collect<T>(path, query, Infinity, undefined, () => Date.now() > deadline);
-    if (result.error) throw new FathomApiError(result.error);
+    if (result.error) throw new FathomApiError(result.error, result.status);
     if (result.next_cursor) throw new FathomApiError(`Stopped reading ${path} at the time limit after ${result.items.length} entries.`);
     return result.items;
   }

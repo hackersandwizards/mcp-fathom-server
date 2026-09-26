@@ -22,6 +22,7 @@ async function built(meetings = history()) {
   const pages = pagedMeetings(live);
   const api = fakeApi(url => {
     if (url.pathname.endsWith('/team_members')) return { items: [], next_cursor: null };
+    if (url.pathname.endsWith('/transcript')) return { transcript: [speaker('Late Speaker')] };
     const after = url.searchParams.get('created_after');
     return after ? { items: live.filter(m => m.created_at > after), next_cursor: null } : pages(url);
   });
@@ -167,13 +168,59 @@ describe('MeetingIndex', () => {
     assert.ok(api.calls.some(c => c.url.searchParams.get('created_before') === meetings[9].created_at));
   });
 
-  it('drops meetings a re-walk no longer sees', async () => {
-    const { index, live } = await built();
+  it('re-walks without transcripts, adding shared meetings and dropping deleted ones', async () => {
+    const { index, live, calls, client } = await built();
     live.splice(3, 1);
+    live.splice(10, 0, meeting(200, { created_at: '2026-01-19T12:00:00Z' }));
     (index as unknown as { startWalk: () => void }).startWalk();
+    assert.equal(index.coverage().complete, true, 'the old index stays usable');
+    const before = calls.length;
     await index.backfill();
-    assert.equal(index.size, 24);
+    const walked = calls.slice(before);
+    assert.ok(walked.every(c => c.url.searchParams.get('include_transcript') !== 'true'));
+    assert.deepEqual(walked.filter(c => c.url.pathname.endsWith('/transcript')).map(c => c.url.pathname), ['/external/v1/recordings/200/transcript']);
+    assert.equal(index.size, 25);
     assert.equal(index.findByLink('/calls/4'), undefined);
+    const mcp = await connect(client, index);
+    assert.equal(body(await mcp.callTool({ name: 'find_person', arguments: { name: 'rita' } })).matches[0].spoke_in, 1, 'speakers kept');
+    assert.equal(body(await mcp.callTool({ name: 'find_person', arguments: { name: 'late' } })).matches[0].latest_meeting.recording_id, 200);
+  });
+
+  it('re-reads a day of meetings after a link lookup missed', async () => {
+    const { client, index, calls } = await built();
+    const mcp = await connect(client, index);
+    assert.equal((await mcp.callTool({ name: 'find_meeting_by_link', arguments: { link: '999' } })).isError, true);
+    assert.equal(calls.at(-1)!.url.searchParams.get('created_after'), '2026-01-29T10:00:00.000Z');
+  });
+
+  it('stops the loop on a 401 after the first page of a sync', { timeout: 2000 }, async () => {
+    const meetings = history();
+    const pages = pagedMeetings(meetings);
+    const { client } = fakeApi(url => {
+      if (!url.searchParams.get('created_after')) return pages(url);
+      return url.searchParams.get('cursor') ? new Response('', { status: 401 }) : { items: [meeting(101, { created_at: '2026-02-02T10:00:00Z' })], next_cursor: 'p2' };
+    });
+    const index = new MeetingIndex(client, join(await mkdtemp(join(tmpdir(), 'fathom-index-')), 'index.json'), async () => {});
+    await index.run();
+    assert.equal(index.coverage().complete, true);
+  });
+
+  it('tops up a partial index with a scan of older meetings only', async () => {
+    const meetings = history();
+    const api = fakeApi(url => {
+      if (url.pathname.endsWith('/team_members') || url.searchParams.get('created_after')) return { items: [], next_cursor: null };
+      const before = url.searchParams.get('created_before');
+      return { items: meetings.filter(m => !before || m.created_at < before).slice(0, 10), next_cursor: null };
+    });
+    const index = new MeetingIndex(api.client, join(await mkdtemp(join(tmpdir(), 'fathom-index-')), 'index.json'), async () => {});
+    (index as unknown as { add: (m: unknown[]) => void }).add(meetings.slice(0, 10));
+    (index as unknown as { state: { newest_created_at: string } }).state.newest_created_at = meetings[0].created_at;
+    const mcp = await connect(api.client, index);
+    const result = body(await mcp.callTool({ name: 'find_person', arguments: { name: 'rita', max_scan: 20 } }));
+    assert.equal(result.scanned_meetings, 10);
+    const scan = api.calls.find(c => c.url.searchParams.get('created_before'))!;
+    assert.equal(scan.url.searchParams.get('created_before'), meetings[9].created_at);
+    assert.equal(scan.url.searchParams.get('include_transcript'), 'true');
   });
 
   it('finds an invitee by the speaker name Fathom matched', async () => {
