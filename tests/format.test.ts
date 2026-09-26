@@ -24,6 +24,13 @@ describe('format', () => {
     assert.equal(created_before, new Date(2026, 8, 26).toISOString());
   });
 
+  it('keeps local midnight across a DST change', () => {
+    const { created_after } = dateRangeBounds('last_7_days', new Date(2026, 2, 30, 12));
+    const after = new Date(created_after);
+    assert.equal(after.getHours(), 0);
+    assert.equal(after.getDate(), 23);
+  });
+
   it('prefers the public share URL and lists attendee names in concise mode', () => {
     const m = meeting(1, { calendar_invitees: [{ name: 'Ann', email: 'a@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: null }] });
     const out = formatMeeting(m);

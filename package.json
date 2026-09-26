@@ -16,9 +16,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "node --env-file=.env --import tsx src/index.ts",
+    "dev": "tsx src/index.ts",
     "test": "node --import tsx --test tests/*.test.ts",
-    "inspect": "npx @modelcontextprotocol/inspector node --env-file=.env dist/index.js"
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
   },
   "keywords": [
     "mcp",

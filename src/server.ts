@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module';
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
-import { FathomClient, type MeetingFilters } from './fathom.js';
+import { FathomClient, type Meeting, type MeetingFilters } from './fathom.js';
 import {
   DATE_RANGES,
   SEARCH_FIELDS,
@@ -9,7 +9,8 @@ import {
   formatMeeting,
   formatTranscriptLine,
   matchMeeting,
-  matchesAttendee,
+  inviteeMatches,
+  meetingDate,
   queryWords,
   transcriptSnippets
 } from './format.js';
@@ -25,6 +26,9 @@ Base every statement about what was said or decided on a summary, transcript or 
 - Fathom has no server-side search. search_meetings scans meetings page by page (10 per request, 60 requests per minute), so give it a date range when you can and continue with next_cursor.
 - Pass the meeting url to get_meeting_transcript to get timestamped links into the recording.
 - create_webhook sends meeting data to an outside URL. Confirm the URL with the user first.`;
+
+// Scans stop after this so the tool answers inside Claude Desktop's 240 s tool-call timeout.
+const SCAN_BUDGET_MS = 120_000;
 
 const READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 
@@ -72,6 +76,12 @@ function apiFilters({ date_range, ...filters }: Filters): MeetingFilters {
   };
 }
 
+function resourceId(value: string | string[]): number {
+  const id = Number(value);
+  if (!Number.isInteger(id) || id <= 0) throw new Error(`Invalid recording_id: ${value}`);
+  return id;
+}
+
 function peopleKey(email: string | null, name: string): string {
   return (email || name).toLowerCase();
 }
@@ -109,8 +119,8 @@ export function createServer(client: FathomClient): McpServer {
       description:
         'Find meetings by keywords and/or attendee. Fathom has no search endpoint, so this scans meetings newest first (10 per API request) and matches locally. A meeting matches when every query word appears somewhere in the searched fields (case-insensitive). Transcript matches come with timestamped snippets. If the scan ends before the date range does, continue with next_cursor.',
       inputSchema: z.object({
-        query: z.string().optional().describe("Keywords, e.g. 'pricing renewal'. Every word must appear."),
-        attendee: z.string().optional().describe('Name or email fragment of a calendar invitee, e.g. jane@acme.com or Jane'),
+        query: z.string().trim().optional().describe("Keywords, e.g. 'pricing renewal'. Every word must appear."),
+        attendee: z.string().trim().toLowerCase().optional().describe('Name or email fragment of a calendar invitee, e.g. jane@acme.com or Jane'),
         search_in: z
           .array(z.enum(SEARCH_FIELDS))
           .min(1)
@@ -119,16 +129,36 @@ export function createServer(client: FathomClient): McpServer {
         ...filterShape,
         ...includeShape,
         max_scan: z.number().int().min(10).max(500).default(100).describe('Meetings to scan in this call'),
-        limit: z.number().int().min(1).max(100).default(20).describe('Matches to return'),
+        limit: z.number().int().min(1).max(100).default(20).describe('Stop once this many matches are found'),
         cursor: z.string().optional().describe('next_cursor from the previous search with the same arguments')
       }),
       annotations: READ
     },
     async ({ query, attendee, search_in, max_scan, limit, cursor, response_format, summary_max_chars, ...rest }) => {
       const words = queryWords(query ?? '');
-      if (!words.length && !attendee?.trim()) return fail('Give a query, an attendee, or both.');
+      if (!words.length && !attendee) return fail('Give a query, an attendee, or both.');
       const { include_summary, include_action_items, include_highlights, include_crm_matches, ...filters } = rest;
       const searched = words.length ? search_in : [];
+      const options = {
+        include_summary,
+        include_action_items,
+        include_highlights,
+        include_crm_matches,
+        summary_max_chars,
+        detailed: response_format === 'detailed'
+      };
+      const deadline = Date.now() + SCAN_BUDGET_MS;
+      const matches: Array<Record<string, unknown>> = [];
+      const collectMatch = (meeting: Meeting) => {
+        if (attendee && !meeting.calendar_invitees?.some(i => inviteeMatches(i, attendee))) return;
+        const fields = words.length ? matchMeeting(meeting, words, searched) : [];
+        if (!fields) return;
+        const match = formatMeeting(meeting, options);
+        if (fields.length) match.matched_in = fields;
+        if (fields.includes('transcript')) match.transcript_snippets = transcriptSnippets(meeting, words);
+        matches.push(match);
+      };
+
       const scan = await client.listMeetings(
         {
           ...apiFilters(filters),
@@ -139,36 +169,21 @@ export function createServer(client: FathomClient): McpServer {
           include_crm_matches
         },
         max_scan,
-        cursor
+        cursor,
+        meeting => {
+          collectMatch(meeting);
+          return matches.length >= limit || Date.now() > deadline;
+        }
       );
-
-      const options = {
-        include_summary,
-        include_action_items,
-        include_highlights,
-        include_crm_matches,
-        summary_max_chars,
-        detailed: response_format === 'detailed'
-      };
-      const matches: Array<Record<string, unknown>> = [];
-      for (const meeting of scan.items) {
-        if (attendee && !matchesAttendee(meeting, attendee.trim())) continue;
-        const fields = words.length ? matchMeeting(meeting, words, searched) : [];
-        if (!fields) continue;
-        const match = formatMeeting(meeting, options);
-        if (fields.length) match.matched_in = fields;
-        if (fields.includes('transcript')) match.transcript_snippets = transcriptSnippets(meeting, words);
-        matches.push(match);
-      }
 
       const oldest = scan.items.at(-1);
       return json({
         total_matches: matches.length,
-        meetings: matches.slice(0, limit),
+        meetings: matches,
         scanned: scan.items.length,
         scanned_back_to: oldest ? oldest.created_at : null,
         next_cursor: scan.next_cursor,
-        ...(matches.length > limit ? { note: `${matches.length - limit} more matches in this scan. Raise limit or narrow the query.` } : {})
+        ...(scan.next_cursor ? { note: 'More meetings remain in the date range. Continue with next_cursor.' } : {})
       });
     }
   );
@@ -257,29 +272,33 @@ export function createServer(client: FathomClient): McpServer {
       description:
         "Find people by name or email fragment in the team roster and among calendar invitees of recent meetings. Returns email, whether they are external, and their latest meeting. People who only spoke in a meeting without being invited are not found.",
       inputSchema: z.object({
-        name: z.string().min(1).describe('Name or email fragment, case-insensitive'),
+        name: z.string().trim().toLowerCase().min(1).describe('Name or email fragment, case-insensitive'),
         max_scan: z.number().int().min(10).max(500).default(100).describe('Recent meetings to scan for invitees')
       }),
       annotations: READ
     },
     async ({ name, max_scan }) => {
-      const needle = name.trim().toLowerCase();
-      const hit = (value: string | null | undefined) => !!value && value.toLowerCase().includes(needle);
-      const [members, scan] = await Promise.all([client.listTeamMembers(), client.listMeetings({}, max_scan)]);
+      const deadline = Date.now() + SCAN_BUDGET_MS;
+      const [members, scan] = await Promise.all([
+        client.listTeamMembers(),
+        client.listMeetings({}, max_scan, undefined, () => Date.now() > deadline)
+      ]);
 
       const people = new Map<string, Record<string, unknown> & { meetings: number }>();
       for (const m of members) {
-        if (hit(m.name) || hit(m.email)) people.set(peopleKey(m.email, m.name), { name: m.name, email: m.email, source: 'team', meetings: 0 });
+        if (m.name.toLowerCase().includes(name) || m.email.toLowerCase().includes(name)) {
+          people.set(peopleKey(m.email, m.name), { name: m.name, email: m.email, source: 'team', meetings: 0 });
+        }
       }
       for (const meeting of scan.items) {
         for (const invitee of meeting.calendar_invitees ?? []) {
-          if (!hit(invitee.name) && !hit(invitee.email) && !hit(invitee.matched_speaker_display_name)) continue;
+          if (!inviteeMatches(invitee, name)) continue;
           const key = peopleKey(invitee.email, invitee.name ?? '');
           const person = people.get(key) ?? { name: invitee.name, email: invitee.email, source: 'invitee', meetings: 0 };
           person.external = invitee.is_external;
           person.meetings += 1;
           // Meetings arrive newest first, so the first one seen is the latest.
-          person.latest_meeting ??= { recording_id: meeting.recording_id, title: meeting.title, date: meeting.scheduled_start_time || meeting.created_at };
+          person.latest_meeting ??= { recording_id: meeting.recording_id, title: meeting.title, date: meetingDate(meeting) };
           people.set(key, person);
         }
       }
@@ -339,7 +358,7 @@ export function createServer(client: FathomClient): McpServer {
     new ResourceTemplate('fathom://recordings/{recording_id}/summary', { list: undefined }),
     { title: 'Meeting summary', description: "One meeting's AI summary", mimeType: 'text/markdown' },
     async (uri, { recording_id }) => {
-      const { summary } = await client.getSummary(Number(recording_id));
+      const { summary } = await client.getSummary(resourceId(recording_id));
       return { contents: [{ uri: uri.href, mimeType: 'text/markdown', text: summary?.markdown_formatted ?? '' }] };
     }
   );
@@ -349,7 +368,7 @@ export function createServer(client: FathomClient): McpServer {
     new ResourceTemplate('fathom://recordings/{recording_id}/transcript', { list: undefined }),
     { title: 'Meeting transcript', description: 'One meeting transcript, one line per speaker turn', mimeType: 'text/plain' },
     async (uri, { recording_id }) => {
-      const { transcript } = await client.getTranscript(Number(recording_id));
+      const { transcript } = await client.getTranscript(resourceId(recording_id));
       return { contents: [{ uri: uri.href, mimeType: 'text/plain', text: (transcript ?? []).map(e => formatTranscriptLine(e)).join('\n') }] };
     }
   );

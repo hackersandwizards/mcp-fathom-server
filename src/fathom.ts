@@ -1,9 +1,7 @@
 export const FATHOM_API_BASE_URL = 'https://api.fathom.ai/external/v1';
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RETRIES = 4;
-// Retry-After above this is capped so one tool call stays inside Claude Desktop's 240 s timeout.
 const MAX_RETRY_WAIT_MS = 30_000;
-const MAX_LIST_PAGES = 50;
 
 export type TriggeredFor =
   | 'my_recordings'
@@ -134,6 +132,24 @@ function decodeCursor(cursor?: string): Position {
   return { s: Number(match[1]), c: match[2] || undefined };
 }
 
+function toError(status: number, raw: string, path: string): FathomApiError {
+  let detail = raw.slice(0, 300);
+  try {
+    const json = JSON.parse(raw);
+    detail = json.message ?? json.error ?? JSON.stringify(json.errors ?? json).slice(0, 300);
+  } catch {}
+  const notFound = path.startsWith('/recordings/')
+    ? `Not found (404): ${path}. A recording_id must come from list_meetings or search_meetings. The number in a fathom.video/calls/<id> link is a different ID.`
+    : `Not found (404): ${path}. ${detail}`;
+  const messages: Record<number, string> = {
+    401: 'Fathom rejected the API key (401). Check FATHOM_API_KEY.',
+    403: `Fathom denied access to ${path} (403): ${detail}`,
+    404: notFound,
+    429: `Fathom rate limit still exceeded after ${MAX_RETRIES} retries. The limit is 60 requests per minute, and 30 or fewer for summaries and transcripts. Wait a minute or narrow the request.`
+  };
+  return new FathomApiError(messages[status] ?? `Fathom API error ${status} on ${path}: ${detail}`, status);
+}
+
 export class FathomClient {
   constructor(
     private readonly apiKey: string,
@@ -151,6 +167,7 @@ export class FathomClient {
 
     for (let attempt = 0; ; attempt++) {
       let response: Response;
+      let raw: string;
       try {
         response = await this.fetchImpl(url, {
           method,
@@ -158,6 +175,7 @@ export class FathomClient {
           body: body ? JSON.stringify(body) : undefined,
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
         });
+        raw = await response.text();
       } catch (error) {
         // A POST that timed out may have been processed, so only reads retry network failures.
         if (method === 'GET' && attempt < 2) {
@@ -170,61 +188,56 @@ export class FathomClient {
       const retryable = response.status === 429 || (method === 'GET' && response.status >= 500);
       if (retryable && attempt < MAX_RETRIES) {
         const retryAfter = Number(response.headers.get('retry-after'));
-        const wait = retryAfter > 0 ? retryAfter * 1000 : 1000 * 2 ** attempt;
-        console.error(`[fathom] ${response.status} on ${path}, retrying in ${Math.min(wait, MAX_RETRY_WAIT_MS)} ms`);
-        await this.sleep(Math.min(wait, MAX_RETRY_WAIT_MS));
+        const wait = Math.min(retryAfter > 0 ? retryAfter * 1000 : 1000 * 2 ** attempt, MAX_RETRY_WAIT_MS);
+        console.error(`[fathom] ${response.status} on ${path}, retrying in ${wait} ms`);
+        await this.sleep(wait);
         continue;
       }
 
-      if (!response.ok) throw await this.toError(response, path);
-      if (response.status === 204) return undefined as T;
-      return (await response.json()) as T;
+      if (!response.ok) throw toError(response.status, raw, path);
+      if (!raw) return undefined as T;
+      try {
+        return JSON.parse(raw) as T;
+      } catch {
+        throw new FathomApiError(`Fathom returned a response that is not JSON on ${path}: ${raw.slice(0, 200)}`);
+      }
     }
   }
 
-  private async toError(response: Response, path: string): Promise<FathomApiError> {
-    const raw = await response.text().catch(() => '');
-    let detail = raw.slice(0, 300);
-    try {
-      const json = JSON.parse(raw);
-      detail = json.message ?? json.error ?? JSON.stringify(json.errors ?? json).slice(0, 300);
-    } catch {}
-    const status = response.status;
-    const messages: Record<number, string> = {
-      401: 'Fathom rejected the API key (401). Check FATHOM_API_KEY.',
-      403: `Fathom denied access to ${path} (403): ${detail}`,
-      404: `Not found (404): ${path}. A recording_id must come from list_meetings or search_meetings. The number in a fathom.video/calls/<id> link is a different ID.`,
-      429: `Fathom rate limit still exceeded after ${MAX_RETRIES} retries. The limit is 60 requests per minute, and 30 or fewer for summaries and transcripts. Wait a minute or narrow the request.`
-    };
-    return new FathomApiError(messages[status] ?? `Fathom API error ${status} on ${path}: ${detail}`, status);
-  }
-
-  /** Returns up to `limit` items starting at `cursor`, following Fathom's pages as needed. */
-  async collect<T>(path: string, query: Query, limit: number, cursor?: string): Promise<{ items: T[]; next_cursor: string | null }> {
+  /**
+   * Returns up to `limit` items starting at `cursor`, following Fathom's pages as needed.
+   * `stopAfter` ends the walk early, after the item it returns true for or once the deadline passes.
+   */
+  async collect<T>(
+    path: string,
+    query: Query,
+    limit: number,
+    cursor?: string,
+    stopAfter?: (item: T) => boolean
+  ): Promise<{ items: T[]; next_cursor: string | null }> {
     let { c, s } = decodeCursor(cursor);
     const items: T[] = [];
     for (;;) {
       const page = await this.request<Page<T>>('GET', path, { ...query, cursor: c });
-      const available = page.items.slice(s);
-      const needed = limit - items.length;
-      if (available.length > needed) {
-        items.push(...available.slice(0, needed));
-        return { items, next_cursor: encodeCursor({ c, s: s + needed }) };
+      for (; s < page.items.length; s++) {
+        items.push(page.items[s]);
+        if (items.length >= limit || stopAfter?.(page.items[s])) {
+          const next = s + 1 < page.items.length ? { c, s: s + 1 } : page.next_cursor ? { c: page.next_cursor, s: 0 } : null;
+          return { items, next_cursor: next && encodeCursor(next) };
+        }
       }
-      items.push(...available);
-      s = 0;
       if (!page.next_cursor) return { items, next_cursor: null };
       c = page.next_cursor;
-      if (items.length === limit) return { items, next_cursor: encodeCursor({ c, s: 0 }) };
+      s = 0;
     }
   }
 
   private async all<T>(path: string, query: Query = {}): Promise<T[]> {
-    return (await this.collect<T>(path, query, MAX_LIST_PAGES * 10)).items;
+    return (await this.collect<T>(path, query, Infinity)).items;
   }
 
-  listMeetings(filters: MeetingFilters, limit: number, cursor?: string) {
-    return this.collect<Meeting>('/meetings', { ...filters }, limit, cursor);
+  listMeetings(filters: MeetingFilters, limit: number, cursor?: string, stopAfter?: (meeting: Meeting) => boolean) {
+    return this.collect<Meeting>('/meetings', { ...filters }, limit, cursor, stopAfter);
   }
 
   getSummary(recordingId: number) {

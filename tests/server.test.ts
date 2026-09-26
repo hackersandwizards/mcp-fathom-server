@@ -77,4 +77,24 @@ describe('MCP server', () => {
     const { contents } = await client.readResource({ uri: 'fathom://recordings/7/transcript' });
     assert.equal((contents[0] as { text: string }).text, '[00:03] A: hi');
   });
+
+  it('stops a search at limit and continues without losing matches', async () => {
+    const meetings = Array.from({ length: 25 }, (_, i) => meeting(i + 1, { title: i % 2 ? 'Acme sync' : 'Other' }));
+    const { client } = await connect(pagedMeetings(meetings));
+    const search = async (cursor?: string) =>
+      JSON.parse(textOf(await client.callTool({ name: 'search_meetings', arguments: { query: 'acme', search_in: ['title'], limit: 5, ...(cursor ? { cursor } : {}) } })));
+    const first = await search();
+    const second = await search(first.next_cursor);
+    const third = await search(second.next_cursor);
+    const found = [...first.meetings, ...second.meetings, ...third.meetings].map((m: { recording_id: number }) => m.recording_id);
+    assert.deepEqual(found, [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24]);
+    assert.equal(third.next_cursor, null);
+  });
+
+  it('rejects whitespace-only search and person input', async () => {
+    const { client, calls } = await connect(pagedMeetings([]));
+    assert.equal((await client.callTool({ name: 'search_meetings', arguments: { attendee: '  ' } })).isError, true);
+    assert.equal((await client.callTool({ name: 'find_person', arguments: { name: '  ' } })).isError, true);
+    assert.equal(calls.length, 0);
+  });
 });

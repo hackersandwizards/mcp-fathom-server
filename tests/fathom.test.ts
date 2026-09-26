@@ -92,4 +92,14 @@ describe('FathomClient errors and retries', () => {
     await client.deleteWebhook('w/1');
     assert.equal(calls[0].url.pathname, '/external/v1/webhooks/w%2F1');
   });
+
+  it('keeps the recording hint off other 404s', async () => {
+    const { client } = fakeApi(() => new Response('', { status: 404 }));
+    await assert.rejects(client.deleteWebhook('gone'), (error: Error) => !/recording_id/.test(error.message) && /webhooks\/gone/.test(error.message));
+  });
+
+  it('reports a body that is not JSON', async () => {
+    const { client } = fakeApi(() => new Response('<html>proxy</html>', { status: 200 }));
+    await assert.rejects(client.listTeams(), /not JSON.*proxy/);
+  });
 });

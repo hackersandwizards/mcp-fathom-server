@@ -1,4 +1,4 @@
-import type { Meeting, TranscriptEntry } from './fathom.js';
+import type { CalendarInvitee, Meeting, TranscriptEntry } from './fathom.js';
 
 export const DATE_RANGES = ['today', 'yesterday', 'last_7_days', 'last_30_days', 'last_90_days'] as const;
 export type DateRange = (typeof DATE_RANGES)[number];
@@ -6,7 +6,7 @@ export type DateRange = (typeof DATE_RANGES)[number];
 /** Day boundaries use the local time zone of the machine running the server. */
 export function dateRangeBounds(range: DateRange, now = new Date()): { created_after: string; created_before?: string } {
   const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const daysBack = (days: number) => new Date(midnight.getTime() - days * 86_400_000).toISOString();
+  const daysBack = (days: number) => new Date(now.getFullYear(), now.getMonth(), now.getDate() - days).toISOString();
   switch (range) {
     case 'today':
       return { created_after: midnight.toISOString() };
@@ -48,6 +48,9 @@ export function formatTranscriptLine(entry: TranscriptEntry, url?: string): stri
   return `${stamp} ${entry.speaker.display_name}: ${entry.text}`;
 }
 
+export const meetingUrl = (meeting: Meeting) => meeting.share_url || meeting.url;
+export const meetingDate = (meeting: Meeting) => meeting.scheduled_start_time || meeting.created_at;
+
 export interface FormatOptions {
   detailed?: boolean;
   include_summary?: boolean;
@@ -63,11 +66,11 @@ function durationMinutes(meeting: Meeting): number | null {
 }
 
 export function formatMeeting(meeting: Meeting, options: FormatOptions = {}): Record<string, unknown> {
-  const url = meeting.share_url || meeting.url;
+  const url = meetingUrl(meeting);
   const out: Record<string, unknown> = {
     recording_id: meeting.recording_id,
     title: meeting.title || meeting.meeting_title,
-    date: meeting.scheduled_start_time || meeting.created_at,
+    date: meetingDate(meeting),
     duration_minutes: durationMinutes(meeting),
     url
   };
@@ -151,7 +154,7 @@ export function matchMeeting(meeting: Meeting, words: string[], fields: readonly
 
 /** Transcript lines containing the most query words, best first. */
 export function transcriptSnippets(meeting: Meeting, words: string[], max = 3): string[] {
-  const url = meeting.share_url || meeting.url;
+  const url = meetingUrl(meeting);
   return (meeting.transcript ?? [])
     .map(entry => ({ entry, hits: words.filter(word => entry.text.toLowerCase().includes(word)).length }))
     .filter(({ hits }) => hits > 0)
@@ -160,12 +163,7 @@ export function transcriptSnippets(meeting: Meeting, words: string[], max = 3): 
     .map(({ entry }) => formatTranscriptLine(entry, url));
 }
 
-export function matchesAttendee(meeting: Meeting, attendee: string): boolean {
-  const needle = attendee.toLowerCase();
-  return (meeting.calendar_invitees ?? []).some(
-    i =>
-      i.email?.toLowerCase().includes(needle) ||
-      i.name?.toLowerCase().includes(needle) ||
-      i.matched_speaker_display_name?.toLowerCase().includes(needle)
-  );
+/** `needle` is lowercase. Matches an invitee's name, email or matched transcript speaker name. */
+export function inviteeMatches(invitee: CalendarInvitee, needle: string): boolean {
+  return [invitee.name, invitee.email, invitee.matched_speaker_display_name].some(value => value?.toLowerCase().includes(needle));
 }
