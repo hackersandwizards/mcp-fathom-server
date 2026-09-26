@@ -294,13 +294,38 @@ describe('MeetingIndex', () => {
     assert.ok(api.calls.some(c => c.url.pathname.endsWith('/meetings') && c.url.searchParams.get('include_transcript') === 'true'));
   });
 
-  it('finishes a re-walk when a new meeting has no readable transcript', async () => {
-    const { index, live } = await built();
+  it('finishes a re-walk when a new meeting has no readable transcript, and retries it next walk', async () => {
+    const { index, live, calls } = await built();
     live.splice(5, 0, meeting(300, { created_at: '2026-01-24T12:00:00Z' }));
     (index as unknown as { startWalk: () => void }).startWalk();
     await index.backfill();
     assert.equal(index.findByLink('/calls/300')?.recording_id, 300);
     assert.equal(index.size, 26);
+    const before = calls.length;
+    (index as unknown as { startWalk: () => void }).startWalk();
+    await index.backfill();
+    assert.equal(calls.slice(before).filter(c => c.url.pathname.endsWith('/transcript')).length, 1, 'only the missing transcript is retried');
+  });
+
+  it('does not rewrite the file when a sync finds only known meetings', async () => {
+    const { index, path } = await built();
+    const before = (await stat(path)).mtimeMs;
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(await index.freshen(Infinity), undefined);
+    assert.equal((await stat(path)).mtimeMs, before);
+  });
+
+  it('merges a speaker without an email through an alias of an invitee', async () => {
+    const invited = meeting(1, {
+      created_at: '2026-01-02T10:00:00Z',
+      calendar_invitees: [{ name: 'bob@x.com', email: 'bob@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: 'Bob Smith' }]
+    });
+    const spoke = meeting(2, { created_at: '2026-01-03T10:00:00Z', transcript: [speaker('Bob Smith')] });
+    const { index, client } = await built([spoke, invited]);
+    const mcp = await connect(client, index);
+    const { matches } = body(await mcp.callTool({ name: 'find_person', arguments: { name: 'bob', max_scan: 10 } }));
+    assert.equal(matches.length, 1);
+    assert.equal(matches[0].meetings, 2);
   });
 
   it('gives up waiting for a busy index at the time limit', async () => {

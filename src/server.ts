@@ -394,10 +394,13 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
       const seen = meetings.flatMap(meeting => meeting.people.filter(p => anyIncludes([p.name, p.email, ...(p.aliases ?? [])], name)).map(p => ({ meeting, p })));
       // A name shown without an email, such as an unmatched speaker, joins the one email seen with that name.
       const emailByName = new Map<string, string | null>();
-      for (const { name: n, email } of [...members, ...seen.map(({ p }) => p)]) {
-        if (!n || !email) continue;
-        const known = emailByName.get(n.toLowerCase());
-        emailByName.set(n.toLowerCase(), known === undefined || known === email.toLowerCase() ? email.toLowerCase() : null);
+      const named = [...members.map(m => ({ names: [m.name], email: m.email })), ...seen.map(({ p }) => ({ names: [p.name, ...(p.aliases ?? [])], email: p.email }))];
+      for (const { names, email } of named) {
+        for (const n of names) {
+          if (!n || !email) continue;
+          const known = emailByName.get(n.toLowerCase());
+          emailByName.set(n.toLowerCase(), known === undefined || known === email.toLowerCase() ? email.toLowerCase() : null);
+        }
       }
       const keyOf = (email: string | null, n: string | null) => (email || (n && emailByName.get(n.toLowerCase())) || n || '').toLowerCase();
 
