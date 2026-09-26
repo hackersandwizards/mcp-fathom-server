@@ -20,6 +20,8 @@ const FRESH_MS = 60_000;
 const SAVE_EVERY_PAGES = 10;
 // The background loop fetches new meetings this often, without a time limit, so gaps close.
 const FORWARD_EVERY_MS = 10 * 60_000;
+// An empty transcript of a younger meeting may still be processing, so it is read again later.
+const PROCESSING_MS = 7 * 24 * 3_600_000;
 // Forward syncs re-read this far behind the newest indexed meeting, so transcripts that were still
 // processing when a meeting was first indexed fill in.
 const REFRESH_OVERLAP_MS = 24 * 3_600_000;
@@ -62,7 +64,6 @@ interface State {
   confirming_sweep?: boolean;
   completed_at?: string;
   walk?: number;
-  forward_synced_at?: string;
   meetings: Record<string, IndexedMeeting>;
 }
 
@@ -147,6 +148,7 @@ export class MeetingIndex {
   private pagesSinceSave = 0;
   private freshAt = 0;
   private missAt = 0;
+  private syncTriedAt = 0;
   private cursorRejections = 0;
   private exitHooked = false;
   private sorted: IndexedMeeting[] | null = null;
@@ -246,21 +248,27 @@ export class MeetingIndex {
   }
 
   /**
-   * A meeting listed without its transcript keeps the speakers found earlier. A new one is marked,
-   * so a later listing with transcripts reads its speakers.
+   * `withTranscripts`: the listing asked for transcripts. A meeting listed without its speakers keeps
+   * the ones found earlier. It is marked for a later listing with transcripts when it is new, or when
+   * its transcript is empty and may still be processing. Returns whether any stored meeting changed.
    */
-  private add(meetings: Meeting[]): void {
+  private add(meetings: Meeting[], withTranscripts: boolean): boolean {
     const walk = this.state.walk ?? 0;
+    const strip = (m?: IndexedMeeting) => m && JSON.stringify({ ...m, walk: 0 });
+    let changed = false;
     for (const m of meetings) {
       const indexed: IndexedMeeting = { ...toIndexed(m), walk };
       const known = this.state.meetings[m.recording_id];
-      if (!m.transcript) {
+      if (!m.transcript?.length) {
         if (known) indexed.people = known.people;
-        if (!known || known.speakers_missing) indexed.speakers_missing = true;
+        const young = Date.now() - Date.parse(m.created_at) < PROCESSING_MS;
+        if (withTranscripts ? young && !indexed.people.some(p => p.spoke) : !known || known.speakers_missing) indexed.speakers_missing = true;
       }
+      changed ||= strip(known) !== strip(indexed);
       this.state.meetings[m.recording_id] = indexed;
     }
     if (meetings.length) this.sorted = this.byLink = null;
+    return changed;
   }
 
   private async save(): Promise<void> {
@@ -293,10 +301,10 @@ export class MeetingIndex {
     // A restarted first walk re-reads pages it already holds cheaply as well.
     const rewalk = this.state.complete || (this.state.walk ?? 0) > 0;
     const page = await this.client.listMeetings({ include_transcript: !rewalk }, 10, cursor);
-    this.add(page.items);
+    this.add(page.items, !rewalk);
     if (rewalk && page.items.some(m => this.state.meetings[m.recording_id]?.speakers_missing)) {
       const full = await this.client.listMeetings({ include_transcript: true }, 10, cursor).catch(() => null);
-      if (full) this.add(full.items);
+      if (full) this.add(full.items, true);
     }
     if (!cursor && page.items[0]) this.raiseWatermark(page.items[0].created_at);
     this.state.backfill_cursor = page.next_cursor;
@@ -323,11 +331,10 @@ export class MeetingIndex {
 
   /**
    * Adds meetings created since the newest indexed one, re-reading `overlapMs` before it for
-   * meetings that finished processing late. Only the background sync records its time, and a tool
-   * call saves only what it adds. The watermark moves only after every page arrived, so a
-   * cut-short sync leaves no gap.
+   * meetings that finished processing late, and saves only what changed. The watermark moves only
+   * after every page arrived, so a cut-short sync leaves no gap.
    */
-  private async forward(deadline: number, overlapMs: number, background: boolean): Promise<void> {
+  private async forward(deadline: number, overlapMs: number): Promise<void> {
     const newest = this.state.newest_created_at;
     // An empty index is current only once a completed walk found no meetings at all.
     if (!newest && !this.state.complete) return;
@@ -336,25 +343,26 @@ export class MeetingIndex {
     // meetings whose speakers are missing, such as ones still processing at the last sync.
     const list = (include_transcript: boolean) =>
       this.client.listMeetings({ created_after: since || undefined, include_transcript }, Infinity, undefined, () => Date.now() > deadline);
-    const missing = () => new Set(Object.values(this.state.meetings).filter(m => m.speakers_missing).map(m => m.recording_id));
-    const before = { size: Object.keys(this.state.meetings).length, missing: missing() };
     let page = await list(false);
-    this.add(page.items);
+    let changed = this.add(page.items, false);
     if (!page.error && !page.next_cursor && page.items.some(m => this.state.meetings[m.recording_id].speakers_missing)) {
       page = await list(true);
-      this.add(page.items);
+      changed = this.add(page.items, true) || changed;
     }
-    const after = missing();
-    const changed = Object.keys(this.state.meetings).length !== before.size || [...before.missing].some(id => !after.has(id));
     if (page.error || page.next_cursor) {
       await this.save();
       throw new FathomApiError(page.error ?? 'Stopped at the time limit.', page.status);
     }
     for (const m of page.items) this.raiseWatermark(m.created_at);
     this.freshAt = Date.now();
-    // Only the writer's loop reads this time, so it is saved with the next change rather than alone.
-    if (background) this.state.forward_synced_at = new Date().toISOString();
     if (changed) await this.save();
+  }
+
+  /** The background sync, every FORWARD_EVERY_MS, re-reading a day for meetings that finished late. */
+  private async syncIfDue(): Promise<void> {
+    if (Date.now() - this.syncTriedAt < FORWARD_EVERY_MS) return;
+    this.syncTriedAt = Date.now();
+    await this.serial(() => this.forward(Infinity, REFRESH_OVERLAP_MS));
   }
 
   private handleLoopError(error: unknown): 'stop' | 'continue' {
@@ -372,10 +380,16 @@ export class MeetingIndex {
 
   /** Walks the history until every meeting is indexed. Writer only. False means stop for good. */
   async backfill(): Promise<boolean> {
+    const started = Date.now();
     while (this.writer && (!this.state.complete || this.state.walking) && !this.stopped) {
       try {
         await this.serial(() => this.walkPage());
         this.cursorRejections = 0;
+        // New meetings keep arriving during a long walk, so it syncs on the loop's schedule too.
+        if (Date.now() - started > FORWARD_EVERY_MS) {
+          const sync = await this.syncIfDue().then(() => 'continue' as const, error => this.handleLoopError(error));
+          if (sync === 'stop') return false;
+        }
         await this.sleep(BACKFILL_PAUSE_MS);
       } catch (error) {
         // Keep the pages read since the last save, so a restart resumes from here.
@@ -410,7 +424,7 @@ export class MeetingIndex {
           if (!this.state.complete || this.state.walking) continue;
           console.error(`[index] Complete: ${this.size} meetings`);
         }
-        if (age(this.state.forward_synced_at) > FORWARD_EVERY_MS) await this.serial(() => this.forward(Infinity, REFRESH_OVERLAP_MS, true));
+        await this.syncIfDue();
         await this.sleep(IDLE_MS);
       } catch (error) {
         if (this.handleLoopError(error) === 'stop') return this.resign();
@@ -440,7 +454,7 @@ export class MeetingIndex {
     const busy = 'the index was busy until the time limit.';
     const sync = this.serial(async () => {
       if (Date.now() > deadline) throw new FathomApiError(busy);
-      await this.forward(deadline, overlap ? REFRESH_OVERLAP_MS : 0, false);
+      await this.forward(deadline, overlap ? REFRESH_OVERLAP_MS : 0);
     });
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => {

@@ -296,17 +296,18 @@ describe('MeetingIndex', () => {
     assert.ok(api.calls.some(c => c.url.pathname.endsWith('/meetings') && c.url.searchParams.get('include_transcript') === 'true'));
   });
 
-  it('finishes a re-walk when a new meeting has no readable transcript, and retries it next walk', async () => {
+  it('re-reads a young meeting without a transcript on the next walk, and accepts an old one as final', async () => {
     const { index, live, calls } = await built();
-    live.splice(5, 0, meeting(300, { created_at: '2026-01-24T12:00:00Z', transcript: null as never }));
+    live.unshift(meeting(300, { created_at: new Date().toISOString(), transcript: null as never }));
+    live.splice(15, 0, meeting(301, { created_at: '2026-01-15T12:00:00Z', transcript: null as never }));
     (index as unknown as { startWalk: () => void }).startWalk();
     await index.backfill();
     assert.equal(index.findByLink('/calls/300')?.recording_id, 300);
-    assert.equal(index.size, 26);
+    assert.equal(index.size, 27);
     const before = calls.length;
     (index as unknown as { startWalk: () => void }).startWalk();
     await index.backfill();
-    assert.equal(calls.slice(before).filter(c => c.url.searchParams.get('include_transcript') === 'true').length, 1, 'only the page with the missing transcript is re-read');
+    assert.equal(calls.slice(before).filter(c => c.url.searchParams.get('include_transcript') === 'true').length, 1, 'only the page with the young meeting is re-read');
   });
 
   it('does not rewrite the file when a sync finds only known meetings', async () => {
@@ -384,7 +385,7 @@ describe('MeetingIndex', () => {
 
   it('re-reads the last day without transcripts, and saves speakers it fills in', async () => {
     const { index, live, calls, path } = await built();
-    const forward = () => (index as unknown as { forward: (d: number, o: number, b: boolean) => Promise<void> }).forward(Infinity, 24 * 3_600_000, true);
+    const forward = () => (index as unknown as { forward: (d: number, o: number) => Promise<void> }).forward(Infinity, 24 * 3_600_000);
     let before = calls.length;
     await forward();
     assert.deepEqual(calls.slice(before).map(c => c.url.searchParams.get('include_transcript')), ['false'], 'nothing missing, one cheap listing');
@@ -394,6 +395,9 @@ describe('MeetingIndex', () => {
     await forward();
     assert.deepEqual(calls.slice(before).map(c => c.url.searchParams.get('include_transcript')), ['false', 'true']);
     assert.match(await readFile(path, 'utf8'), /Zed Late/);
+    live[1].title = 'Renamed in Fathom';
+    await forward();
+    assert.match(await readFile(path, 'utf8'), /Renamed in Fathom/, 'a changed title is saved too');
   });
 
   it('finds a meeting shared days after it was recorded, which the complete index lacks', async () => {
