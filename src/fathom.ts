@@ -2,6 +2,9 @@ export const FATHOM_API_BASE_URL = 'https://api.fathom.ai/external/v1';
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RETRIES = 4;
 const MAX_RETRY_WAIT_MS = 30_000;
+// Retries stop once they would push one request past this, so a scan's last request cannot
+// carry a tool call past Claude Desktop's 240 s timeout.
+const REQUEST_BUDGET_MS = 60_000;
 
 export type TriggeredFor =
   | 'my_recordings'
@@ -136,7 +139,8 @@ function toError(status: number, raw: string, path: string): FathomApiError {
   let detail = raw.slice(0, 300);
   try {
     const json = JSON.parse(raw);
-    detail = json.message ?? json.error ?? JSON.stringify(json.errors ?? json).slice(0, 300);
+    const message = json.message ?? json.error;
+    detail = typeof message === 'string' ? message : JSON.stringify(json).slice(0, 300);
   } catch {}
   const notFound = path.startsWith('/recordings/')
     ? `Not found (404): ${path}. A recording_id must come from list_meetings or search_meetings. The number in a fathom.video/calls/<id> link is a different ID.`
@@ -165,6 +169,8 @@ export class FathomClient {
       else url.searchParams.set(key, String(value));
     }
 
+    const started = Date.now();
+    const canWait = (ms: number) => Date.now() - started + ms < REQUEST_BUDGET_MS;
     for (let attempt = 0; ; attempt++) {
       let response: Response;
       let raw: string;
@@ -178,7 +184,7 @@ export class FathomClient {
         raw = await response.text();
       } catch (error) {
         // A POST that timed out may have been processed, so only reads retry network failures.
-        if (method === 'GET' && attempt < 2) {
+        if (method === 'GET' && attempt < 2 && canWait(1000 * 2 ** attempt)) {
           await this.sleep(1000 * 2 ** attempt);
           continue;
         }
@@ -186,9 +192,9 @@ export class FathomClient {
       }
 
       const retryable = response.status === 429 || (method === 'GET' && response.status >= 500);
-      if (retryable && attempt < MAX_RETRIES) {
-        const retryAfter = Number(response.headers.get('retry-after'));
-        const wait = Math.min(retryAfter > 0 ? retryAfter * 1000 : 1000 * 2 ** attempt, MAX_RETRY_WAIT_MS);
+      const retryAfter = Number(response.headers.get('retry-after'));
+      const wait = Math.min(retryAfter > 0 ? retryAfter * 1000 : 1000 * 2 ** attempt, MAX_RETRY_WAIT_MS);
+      if (retryable && attempt < MAX_RETRIES && canWait(wait)) {
         console.error(`[fathom] ${response.status} on ${path}, retrying in ${wait} ms`);
         await this.sleep(wait);
         continue;
@@ -206,7 +212,8 @@ export class FathomClient {
 
   /**
    * Returns up to `limit` items starting at `cursor`, following Fathom's pages as needed.
-   * `stopAfter` ends the walk early, after the item it returns true for or once the deadline passes.
+   * `stopAfter` ends the walk early, after the item it returns true for. When a later page fails,
+   * the items read so far come back with `error` and a cursor that retries that page.
    */
   async collect<T>(
     path: string,
@@ -214,14 +221,21 @@ export class FathomClient {
     limit: number,
     cursor?: string,
     stopAfter?: (item: T) => boolean
-  ): Promise<{ items: T[]; next_cursor: string | null }> {
+  ): Promise<{ items: T[]; next_cursor: string | null; error?: string }> {
     let { c, s } = decodeCursor(cursor);
     const items: T[] = [];
     for (;;) {
-      const page = await this.request<Page<T>>('GET', path, { ...query, cursor: c });
+      let page: Page<T>;
+      try {
+        page = await this.request<Page<T>>('GET', path, { ...query, cursor: c });
+      } catch (error) {
+        if (!items.length) throw error;
+        return { items, next_cursor: encodeCursor({ c, s }), error: (error as Error).message };
+      }
       for (; s < page.items.length; s++) {
         items.push(page.items[s]);
-        if (items.length >= limit || stopAfter?.(page.items[s])) {
+        const stop = stopAfter?.(page.items[s]);
+        if (items.length >= limit || stop) {
           const next = s + 1 < page.items.length ? { c, s: s + 1 } : page.next_cursor ? { c: page.next_cursor, s: 0 } : null;
           return { items, next_cursor: next && encodeCursor(next) };
         }
@@ -240,12 +254,14 @@ export class FathomClient {
     return this.collect<Meeting>('/meetings', { ...filters }, limit, cursor, stopAfter);
   }
 
-  getSummary(recordingId: number) {
-    return this.request<{ summary: Summary }>('GET', `/recordings/${recordingId}/summary`);
+  async getSummary(recordingId: number): Promise<Summary | null> {
+    const body = await this.request<{ summary?: Summary } | undefined>('GET', `/recordings/${recordingId}/summary`);
+    return body?.summary ?? null;
   }
 
-  getTranscript(recordingId: number) {
-    return this.request<{ transcript: TranscriptEntry[] }>('GET', `/recordings/${recordingId}/transcript`);
+  async getTranscript(recordingId: number): Promise<TranscriptEntry[]> {
+    const body = await this.request<{ transcript?: TranscriptEntry[] } | undefined>('GET', `/recordings/${recordingId}/transcript`);
+    return body?.transcript ?? [];
   }
 
   listTeams() {

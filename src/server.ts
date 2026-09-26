@@ -82,8 +82,8 @@ function resourceId(value: string | string[]): number {
   return id;
 }
 
-function peopleKey(email: string | null, name: string): string {
-  return (email || name).toLowerCase();
+function peopleKey(email: string | null, name: string | null): string {
+  return (email || name || '').toLowerCase();
 }
 
 export function createServer(client: FathomClient): McpServer {
@@ -183,6 +183,7 @@ export function createServer(client: FathomClient): McpServer {
         scanned: scan.items.length,
         scanned_back_to: oldest ? oldest.created_at : null,
         next_cursor: scan.next_cursor,
+        ...(scan.error ? { error: `Scan stopped early: ${scan.error}` } : {}),
         ...(scan.next_cursor ? { note: 'More meetings remain in the date range. Continue with next_cursor.' } : {})
       });
     }
@@ -197,7 +198,7 @@ export function createServer(client: FathomClient): McpServer {
       annotations: READ
     },
     async ({ recording_id }) => {
-      const { summary } = await client.getSummary(recording_id);
+      const summary = await client.getSummary(recording_id);
       return text(summary?.markdown_formatted ?? 'This meeting has no summary.');
     }
   );
@@ -218,8 +219,8 @@ export function createServer(client: FathomClient): McpServer {
       _meta: { 'anthropic/maxResultSizeChars': 500_000 }
     },
     async ({ recording_id, url, start, max_entries }) => {
-      const { transcript } = await client.getTranscript(recording_id);
-      if (!transcript?.length) return text('This meeting has no transcript.');
+      const transcript = await client.getTranscript(recording_id);
+      if (!transcript.length) return text('This meeting has no transcript.');
       const entries = transcript.slice(start, start + max_entries);
       if (!entries.length) return fail(`start=${start} is past the end. The transcript has ${transcript.length} entries.`);
       const end = start + entries.length;
@@ -286,14 +287,14 @@ export function createServer(client: FathomClient): McpServer {
 
       const people = new Map<string, Record<string, unknown> & { meetings: number }>();
       for (const m of members) {
-        if (m.name.toLowerCase().includes(name) || m.email.toLowerCase().includes(name)) {
+        if (m.name?.toLowerCase().includes(name) || m.email?.toLowerCase().includes(name)) {
           people.set(peopleKey(m.email, m.name), { name: m.name, email: m.email, source: 'team', meetings: 0 });
         }
       }
       for (const meeting of scan.items) {
         for (const invitee of meeting.calendar_invitees ?? []) {
           if (!inviteeMatches(invitee, name)) continue;
-          const key = peopleKey(invitee.email, invitee.name ?? '');
+          const key = peopleKey(invitee.email, invitee.name || invitee.matched_speaker_display_name);
           const person = people.get(key) ?? { name: invitee.name, email: invitee.email, source: 'invitee', meetings: 0 };
           person.external = invitee.is_external;
           person.meetings += 1;
@@ -302,7 +303,11 @@ export function createServer(client: FathomClient): McpServer {
           people.set(key, person);
         }
       }
-      return json({ matches: [...people.values()], scanned_meetings: scan.items.length });
+      return json({
+        matches: [...people.values()],
+        scanned_meetings: scan.items.length,
+        ...(scan.error ? { error: `Scan stopped early: ${scan.error}` } : {})
+      });
     }
   );
 
@@ -358,7 +363,7 @@ export function createServer(client: FathomClient): McpServer {
     new ResourceTemplate('fathom://recordings/{recording_id}/summary', { list: undefined }),
     { title: 'Meeting summary', description: "One meeting's AI summary", mimeType: 'text/markdown' },
     async (uri, { recording_id }) => {
-      const { summary } = await client.getSummary(resourceId(recording_id));
+      const summary = await client.getSummary(resourceId(recording_id));
       return { contents: [{ uri: uri.href, mimeType: 'text/markdown', text: summary?.markdown_formatted ?? '' }] };
     }
   );
@@ -368,8 +373,8 @@ export function createServer(client: FathomClient): McpServer {
     new ResourceTemplate('fathom://recordings/{recording_id}/transcript', { list: undefined }),
     { title: 'Meeting transcript', description: 'One meeting transcript, one line per speaker turn', mimeType: 'text/plain' },
     async (uri, { recording_id }) => {
-      const { transcript } = await client.getTranscript(resourceId(recording_id));
-      return { contents: [{ uri: uri.href, mimeType: 'text/plain', text: (transcript ?? []).map(e => formatTranscriptLine(e)).join('\n') }] };
+      const transcript = await client.getTranscript(resourceId(recording_id));
+      return { contents: [{ uri: uri.href, mimeType: 'text/plain', text: transcript.map(e => formatTranscriptLine(e)).join('\n') }] };
     }
   );
 

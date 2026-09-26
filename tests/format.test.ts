@@ -28,7 +28,7 @@ describe('format', () => {
     const { created_after } = dateRangeBounds('last_7_days', new Date(2026, 2, 30, 12));
     const after = new Date(created_after);
     assert.equal(after.getHours(), 0);
-    assert.equal(after.getDate(), 23);
+    assert.equal(after.getDate(), 24);
   });
 
   it('prefers the public share URL and lists attendee names in concise mode', () => {

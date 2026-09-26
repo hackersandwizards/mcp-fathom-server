@@ -5,7 +5,9 @@ import { createServer } from './server.js';
 
 try {
   process.loadEnvFile();
-} catch {}
+} catch (error) {
+  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+}
 
 const apiKey = process.env.FATHOM_API_KEY;
 if (!apiKey) {

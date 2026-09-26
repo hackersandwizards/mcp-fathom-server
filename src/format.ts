@@ -12,12 +12,13 @@ export function dateRangeBounds(range: DateRange, now = new Date()): { created_a
       return { created_after: midnight.toISOString() };
     case 'yesterday':
       return { created_after: daysBack(1), created_before: midnight.toISOString() };
+    // "Last 7 days" counts today, so it starts 6 days back.
     case 'last_7_days':
-      return { created_after: daysBack(7) };
+      return { created_after: daysBack(6) };
     case 'last_30_days':
-      return { created_after: daysBack(30) };
+      return { created_after: daysBack(29) };
     case 'last_90_days':
-      return { created_after: daysBack(90) };
+      return { created_after: daysBack(89) };
   }
 }
 

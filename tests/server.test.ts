@@ -97,4 +97,26 @@ describe('MCP server', () => {
     assert.equal((await client.callTool({ name: 'find_person', arguments: { name: '  ' } })).isError, true);
     assert.equal(calls.length, 0);
   });
+
+  it('checks the last meeting of the scan window', async () => {
+    const meetings = Array.from({ length: 15 }, (_, i) => meeting(i + 1, { title: i === 9 ? 'Acme' : 'Other' }));
+    const { client } = await connect(pagedMeetings(meetings));
+    const body = JSON.parse(textOf(await client.callTool({ name: 'search_meetings', arguments: { query: 'acme', search_in: ['title'], max_scan: 10 } })));
+    assert.deepEqual(body.meetings.map((m: { recording_id: number }) => m.recording_id), [10]);
+  });
+
+  it('keeps matches found before a later page fails', async () => {
+    const meetings = Array.from({ length: 20 }, (_, i) => meeting(i + 1, { title: 'Acme' }));
+    const pages = pagedMeetings(meetings);
+    const { client } = await connect(url => (url.searchParams.get('cursor') ? new Response('', { status: 401 }) : pages(url)));
+    const body = JSON.parse(textOf(await client.callTool({ name: 'search_meetings', arguments: { query: 'acme', search_in: ['title'], limit: 50 } })));
+    assert.equal(body.meetings.length, 10);
+    assert.match(body.error, /FATHOM_API_KEY/);
+    assert.ok(body.next_cursor);
+  });
+
+  it('answers an empty summary body', async () => {
+    const { client } = await connect(() => new Response('', { status: 200 }));
+    assert.equal(textOf(await client.callTool({ name: 'get_meeting_summary', arguments: { recording_id: 1 } })), 'This meeting has no summary.');
+  });
 });

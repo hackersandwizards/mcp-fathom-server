@@ -32,7 +32,7 @@ Every read tool is marked read-only, so clients can run it without asking. `dele
 
 ## Setup
 
-You need Node.js 20 or later and a Fathom API key from the API Access section of your [Fathom user settings](https://fathom.video/customize#api-access-header).
+You need Node.js 20.12 or later and a Fathom API key from the API Access section of your [Fathom user settings](https://fathom.video/customize#api-access-header).
 
 ```bash
 git clone https://github.com/hackersandwizards/mcp-fathom-server.git
