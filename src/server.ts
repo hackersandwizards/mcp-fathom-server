@@ -6,6 +6,8 @@ import { type IndexedMeeting, linkPath, type MeetingIndex, toIndexed } from './m
 import {
   DATE_RANGES,
   anyIncludes,
+  meetingDate,
+  meetingUrl,
   SEARCH_FIELDS,
   dateRangeBounds,
   formatMeeting,
@@ -230,17 +232,18 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
       const deadline = Date.now() + SCAN_BUDGET_MS;
 
       let scanFilters: MeetingFilters = {};
-      if (index?.size) {
-        const refreshed = await index.refresh(deadline).then(
-          () => true,
-          error => (console.error(`[index] Refresh failed: ${error.message}`), false)
-        );
+      let scanned = 'most recent meetings';
+      if (index) {
+        const warning = await index.freshen(deadline);
         const hit = index.findByLink(path);
         if (hit) return json({ recording_id: hit.recording_id, title: hit.title, date: hit.date, url: hit.share_url || hit.url });
         const { complete, oldest_indexed } = index.coverage();
-        if (refreshed && complete) return fail('No meeting with this link is visible to this API key.');
-        // The index already checked everything newer than its oldest meeting, unless the refresh failed.
-        if (refreshed && oldest_indexed) scanFilters = { created_before: oldest_indexed };
+        if (!warning && complete) return fail('No meeting with this link is visible to this API key.');
+        // A current index already checked everything newer than its oldest meeting.
+        if (!warning && oldest_indexed) {
+          scanFilters = { created_before: oldest_indexed };
+          scanned = `meetings older than the index (before ${oldest_indexed})`;
+        }
       }
 
       let found: Meeting | undefined;
@@ -248,9 +251,9 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
         if (matches(meeting)) found = meeting;
         return !!found || Date.now() > deadline;
       });
-      if (found) return json(formatMeeting(found, { detailed: true }));
+      if (found) return json({ recording_id: found.recording_id, title: found.title || found.meeting_title, date: meetingDate(found), url: meetingUrl(found) });
       return fail(
-        `No meeting with this link among the ${scan.items.length} most recent meetings.${scan.error ? ` Scan stopped early: ${scan.error}` : ''} Raise max_scan, or ask the user for the meeting title or date.`
+        `No meeting with this link among the ${scan.items.length} ${scanned}.${scan.error ? ` Scan stopped early: ${scan.error}` : ''} Raise max_scan, or ask the user for the meeting title or date.`
       );
     }
   );
@@ -355,13 +358,10 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
       let meetings: IndexedMeeting[];
       let coverage: Record<string, unknown>;
       // A partial index smaller than the requested scan would search fewer meetings than the scan.
+      const warning = await index?.freshen(deadline);
       if (index && (index.coverage().complete || index.size >= max_scan)) {
-        const refreshError = await index.refresh(deadline).then(
-          () => undefined,
-          (error: Error) => error.message
-        );
         meetings = index.meetings();
-        coverage = { index: index.coverage(), ...(refreshError ? { index_warning: `Newest meetings may be missing: ${refreshError}` } : {}) };
+        coverage = { index: index.coverage(), ...(warning ? { index_warning: warning } : {}) };
       } else {
         const scan = await client
           .listMeetings({}, max_scan, undefined, () => Date.now() > deadline)
@@ -379,7 +379,7 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
       // Newest first, so the first meeting seen for a person is their latest.
       for (const meeting of meetings) {
         for (const p of meeting.people) {
-          if (!anyIncludes([p.name, p.email], name)) continue;
+          if (!anyIncludes([p.name, p.email, ...(p.aliases ?? [])], name)) continue;
           const key = peopleKey(p.email, p.name);
           const person = people.get(key) ?? { name: p.name, email: p.email, meetings: 0, spoke_in: 0 };
           person.external ??= p.external ?? undefined;

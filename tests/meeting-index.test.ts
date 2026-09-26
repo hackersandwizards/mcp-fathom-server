@@ -102,7 +102,7 @@ describe('MeetingIndex', () => {
       transcript: [speaker('Alice S.'), speaker('Bob')]
     });
     assert.deepEqual(peopleOf(m), [
-      { name: 'Alice Smith', email: 'alice@x.com', external: true, invited: true, spoke: true },
+      { name: 'Alice Smith', email: 'alice@x.com', external: true, invited: true, spoke: true, aliases: ['Alice S.'] },
       { name: 'Bob', email: null, external: null, invited: false, spoke: true }
     ]);
   });
@@ -122,9 +122,9 @@ describe('MeetingIndex', () => {
     await index.lock();
     await index.backfill();
     failSecondPage = true;
-    await assert.rejects(index.refresh());
+    assert.match((await index.freshen(Infinity))!, /missing/);
     failSecondPage = false;
-    await index.refresh();
+    assert.equal(await index.freshen(Infinity), undefined);
     assert.equal(index.findByLink('/calls/100')?.recording_id, 100);
   });
 
@@ -166,5 +166,21 @@ describe('MeetingIndex', () => {
     const mcp = await connect(api.client, index);
     assert.equal(body(await mcp.callTool({ name: 'find_meeting_by_link', arguments: { link: '/share/s20' } })).recording_id, 20);
     assert.ok(api.calls.some(c => c.url.searchParams.get('created_before') === meetings[9].created_at));
+  });
+
+  it('drops meetings a re-walk no longer sees', async () => {
+    const { index, live } = await built();
+    live.splice(3, 1);
+    (index as unknown as { startWalk: () => void }).startWalk();
+    await index.backfill();
+    assert.equal(index.size, 24);
+    assert.equal(index.findByLink('/calls/4'), undefined);
+  });
+
+  it('finds an invitee by the speaker name Fathom matched', async () => {
+    const m = meeting(1, { calendar_invitees: [{ name: 'Robert Smith', email: 'rob@x.com', email_domain: 'x.com', is_external: false, matched_speaker_display_name: 'Bob' }] });
+    const { index, client } = await built([m]);
+    const mcp = await connect(client, index);
+    assert.equal(body(await mcp.callTool({ name: 'find_person', arguments: { name: 'bob', max_scan: 10 } })).matches[0].email, 'rob@x.com');
   });
 });

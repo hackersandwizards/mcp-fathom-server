@@ -15,7 +15,8 @@ let index: MeetingIndex | undefined;
 if (process.env.FATHOM_INDEX !== 'off') {
   index = new MeetingIndex(client, defaultIndexPath(apiKey));
   await index.load();
-  if (await index.lock()) void index.backfill();
+  // The loop logs and retries its own errors, such as an unwritable cache directory; tools fall back to scans.
+  void index.run();
 }
 serveStdio(() => createServer(client, index));
 console.error('Fathom MCP server running on stdio');
