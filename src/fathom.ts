@@ -123,7 +123,7 @@ export class FathomApiError extends Error {
 
 // Our cursor wraps Fathom's page cursor plus an offset into that page, so a limit that ends
 // mid-page (Fathom's page size is fixed at 10) loses no meetings. It also names the last item
-// returned, so a resume lands after that item even when new meetings shifted the page.
+// returned, so a resume lands after that item even when up to 10 new meetings shifted it.
 interface Position { c?: string; s: number; a?: string }
 
 function encodeCursor({ c, s, a }: Position): string {
@@ -241,7 +241,16 @@ export class FathomClient {
         return { items, next_cursor: encodeCursor({ c, s }), error: (error as Error).message };
       }
       if (a !== undefined && keyOf) {
-        const anchor = page.items.findIndex(item => String(keyOf(item)) === a);
+        const find = (items: T[]) => items.findIndex(item => String(keyOf(item)) === a);
+        let anchor = find(page.items);
+        // New recordings can push the anchor onto the next page; one page of lookahead covers 10.
+        if (anchor < 0 && page.next_cursor) {
+          const nextPage = await this.request<Page<T>>('GET', path, { ...query, cursor: page.next_cursor });
+          if (Array.isArray(nextPage?.items) && (anchor = find(nextPage.items)) >= 0) {
+            c = page.next_cursor;
+            page = nextPage;
+          }
+        }
         if (anchor >= 0) s = anchor + 1;
         a = undefined;
       }

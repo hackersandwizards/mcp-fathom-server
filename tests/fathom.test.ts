@@ -26,6 +26,15 @@ describe('FathomClient pagination', () => {
     assert.deepEqual(ids(second.items), [6, 7, 8]);
   });
 
+  it('finds the resume anchor after new meetings push it to the next page', async () => {
+    const live = meetings.slice();
+    const { client } = fakeApi(url => pagedMeetings(live)(url));
+    const first = await client.listMeetings({}, 5);
+    live.unshift(...[91, 92, 93, 94, 95, 96].map(id => meeting(id)));
+    const second = await client.listMeetings({}, 3, first.next_cursor!);
+    assert.deepEqual(ids(second.items), [6, 7, 8]);
+  });
+
   it('returns a cursor when the limit ends exactly on a page boundary', async () => {
     const { client, calls } = fakeApi(pagedMeetings(meetings));
     const first = await client.listMeetings({}, 10);
