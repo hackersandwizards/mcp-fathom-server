@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@petesena/mcp-fathom-server",
+      "name": "@hackersandwizards/mcp-fathom-server",
       "dependencies": {
         "@modelcontextprotocol/server": "2.1.0",
         "zod": "4.6.5",

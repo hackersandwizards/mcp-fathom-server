@@ -1,5 +1,5 @@
 {
-  "name": "@petesena/mcp-fathom-server",
+  "name": "@hackersandwizards/mcp-fathom-server",
   "version": "2.0.0",
   "description": "MCP server for Fathom AI meeting API integration",
   "type": "module",
@@ -28,7 +28,7 @@
     "meetings",
     "ai"
   ],
-  "author": "petesena",
+  "author": "Hackers and Wizards",
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/server": "2.1.0",
