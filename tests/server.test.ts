@@ -143,4 +143,20 @@ describe('MCP server', () => {
     assert.equal(body.matches[0].email, 'jane@acme.com');
     assert.match(body.roster_error, /403/);
   });
+
+  it('refuses a plain-HTTP webhook URL', async () => {
+    const { client, calls } = await connect(() => ({}));
+    const result = await client.callTool({ name: 'create_webhook', arguments: { destination_url: 'http://x.test', triggered_for: ['my_recordings'], include_summary: true } });
+    assert.equal(result.isError, true);
+    assert.equal(calls.length, 0);
+  });
+
+  it('keeps roster matches when the meeting scan fails', async () => {
+    const { client } = await connect(url =>
+      url.pathname.endsWith('/team_members') ? { items: [{ name: 'Jane Roe', email: 'jane@x.com' }], next_cursor: null } : new Response('', { status: 403 })
+    );
+    const body = JSON.parse(textOf(await client.callTool({ name: 'find_person', arguments: { name: 'jane' } })));
+    assert.equal(body.matches[0].email, 'jane@x.com');
+    assert.match(body.error, /403/);
+  });
 });

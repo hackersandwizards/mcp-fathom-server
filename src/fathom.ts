@@ -3,9 +3,9 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RETRIES = 4;
 // A Retry-After longer than this fails fast instead of retrying before Fathom allows it.
 const MAX_RETRY_WAIT_MS = 30_000;
-// Retries stop once they would push one request past this, so a scan's last request cannot
-// carry a tool call past Claude Desktop's 240 s timeout.
-const REQUEST_BUDGET_MS = 60_000;
+// A retry starts only if its wait plus a full attempt timeout fits in this, so one request ends
+// within 75 s and a scan's last request cannot carry a tool call past Claude Desktop's 240 s timeout.
+const REQUEST_BUDGET_MS = 75_000;
 
 export type TriggeredFor =
   | 'my_recordings'
@@ -121,19 +121,20 @@ export class FathomApiError extends Error {
   }
 }
 
-// Our cursor wraps Fathom's page cursor plus an offset into that page, so a
-// limit that ends mid-page (Fathom's page size is fixed at 10) loses no meetings.
-interface Position { c?: string; s: number }
+// Our cursor wraps Fathom's page cursor plus an offset into that page, so a limit that ends
+// mid-page (Fathom's page size is fixed at 10) loses no meetings. It also names the last item
+// returned, so a resume lands after that item even when new meetings shifted the page.
+interface Position { c?: string; s: number; a?: string }
 
-function encodeCursor({ c, s }: Position): string {
-  return `${s}.${c ?? ''}`;
+function encodeCursor({ c, s, a }: Position): string {
+  return `${s}.${a ?? ''}.${c ?? ''}`;
 }
 
 function decodeCursor(cursor?: string): Position {
   if (!cursor) return { s: 0 };
-  const match = /^(\d+)\.(.*)$/.exec(cursor);
+  const match = /^(\d+)\.([^.]*)\.(.*)$/.exec(cursor);
   if (!match) throw new FathomApiError('Invalid cursor. Pass next_cursor exactly as a previous response returned it.');
-  return { s: Number(match[1]), c: match[2] || undefined };
+  return { s: Number(match[1]), a: match[2] || undefined, c: match[3] || undefined };
 }
 
 function toError(status: number, raw: string, path: string, retries: number, retryAfter: number): FathomApiError {
@@ -171,7 +172,8 @@ export class FathomClient {
     }
 
     const started = Date.now();
-    const canWait = (ms: number) => Date.now() - started + ms < REQUEST_BUDGET_MS;
+    const canWait = (ms: number) => Date.now() - started + ms + REQUEST_TIMEOUT_MS <= REQUEST_BUDGET_MS;
+    let networkFailures = 0;
     for (let attempt = 0; ; attempt++) {
       let response: Response;
       let raw: string;
@@ -185,8 +187,9 @@ export class FathomClient {
         raw = await response.text();
       } catch (error) {
         // A POST that timed out may have been processed, so only reads retry network failures.
-        if (method === 'GET' && attempt < 2 && canWait(1000 * 2 ** attempt)) {
-          await this.sleep(1000 * 2 ** attempt);
+        networkFailures++;
+        if (method === 'GET' && networkFailures <= 2 && canWait(1000 * networkFailures)) {
+          await this.sleep(1000 * networkFailures);
           continue;
         }
         throw new FathomApiError(`Could not reach the Fathom API: ${(error as Error).message}`);
@@ -221,9 +224,10 @@ export class FathomClient {
     query: Query,
     limit: number,
     cursor?: string,
-    stopAfter?: (item: T) => boolean
+    stopAfter?: (item: T) => boolean,
+    keyOf?: (item: T) => string | number
   ): Promise<{ items: T[]; next_cursor: string | null; error?: string }> {
-    let { c, s } = decodeCursor(cursor);
+    let { c, s, a } = decodeCursor(cursor);
     const items: T[] = [];
     for (;;) {
       let page: Page<T>;
@@ -233,11 +237,17 @@ export class FathomClient {
         if (!items.length) throw error;
         return { items, next_cursor: encodeCursor({ c, s }), error: (error as Error).message };
       }
+      if (a !== undefined && keyOf) {
+        const anchor = page.items.findIndex(item => String(keyOf(item)) === a);
+        if (anchor >= 0) s = anchor + 1;
+        a = undefined;
+      }
       for (; s < page.items.length; s++) {
         items.push(page.items[s]);
         const stop = stopAfter?.(page.items[s]);
         if (items.length >= limit || stop) {
-          const next = s + 1 < page.items.length ? { c, s: s + 1 } : page.next_cursor ? { c: page.next_cursor, s: 0 } : null;
+          const anchor = keyOf ? String(keyOf(page.items[s])) : undefined;
+          const next = s + 1 < page.items.length ? { c, s: s + 1, a: anchor } : page.next_cursor ? { c: page.next_cursor, s: 0 } : null;
           return { items, next_cursor: next && encodeCursor(next) };
         }
       }
@@ -256,7 +266,7 @@ export class FathomClient {
   }
 
   listMeetings(filters: MeetingFilters, limit: number, cursor?: string, stopAfter?: (meeting: Meeting) => boolean) {
-    return this.collect<Meeting>('/meetings', { ...filters }, limit, cursor, stopAfter);
+    return this.collect<Meeting>('/meetings', { ...filters }, limit, cursor, stopAfter, meeting => meeting.recording_id);
   }
 
   async getSummary(recordingId: number): Promise<Summary | null> {

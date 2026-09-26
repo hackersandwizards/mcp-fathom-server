@@ -302,12 +302,16 @@ export function createServer(client: FathomClient): McpServer {
     async ({ name, max_scan }) => {
       const deadline = Date.now() + SCAN_BUDGET_MS;
       let rosterError: string | undefined;
+      let scanError: string | undefined;
       const [members, scan] = await Promise.all([
         client.listTeamMembers(undefined, deadline).catch((error: Error) => {
           rosterError = error.message;
           return [];
         }),
-        client.listMeetings({}, max_scan, undefined, () => Date.now() > deadline)
+        client.listMeetings({}, max_scan, undefined, () => Date.now() > deadline).catch((error: Error) => {
+          scanError = error.message;
+          return { items: [] as Meeting[], error: undefined };
+        })
       ]);
 
       const people = new Map<string, Record<string, unknown> & { meetings: number }>();
@@ -320,7 +324,12 @@ export function createServer(client: FathomClient): McpServer {
         for (const invitee of meeting.calendar_invitees ?? []) {
           if (!inviteeMatches(invitee, name)) continue;
           const key = peopleKey(invitee.email, invitee.name || invitee.matched_speaker_display_name);
-          const person = people.get(key) ?? { name: invitee.name, email: invitee.email, source: 'invitee', meetings: 0 };
+          const person = people.get(key) ?? {
+            name: invitee.name || invitee.matched_speaker_display_name,
+            email: invitee.email,
+            source: 'invitee',
+            meetings: 0
+          };
           person.external = invitee.is_external;
           person.meetings += 1;
           // Meetings arrive newest first, so the first one seen is the latest.
@@ -331,7 +340,7 @@ export function createServer(client: FathomClient): McpServer {
       return json({
         matches: [...people.values()],
         scanned_meetings: scan.items.length,
-        ...(scan.error ? { error: `Scan stopped early: ${scan.error}` } : {}),
+        ...(scan.error || scanError ? { error: `Meeting scan stopped early: ${scan.error ?? scanError}` } : {}),
         ...(rosterError ? { roster_error: `Team roster not searched: ${rosterError}` } : {})
       });
     }
@@ -344,7 +353,7 @@ export function createServer(client: FathomClient): McpServer {
       description:
         'Register a URL that Fathom POSTs each new meeting to once its summary is ready. Confirm the URL with the user first: it receives real meeting data. Returns the webhook id and signing secret, which Fathom never shows again.',
       inputSchema: z.object({
-        destination_url: z.string().url().describe('HTTPS endpoint that receives the meeting payload'),
+        destination_url: z.url({ protocol: /^https$/ }).describe('HTTPS endpoint that receives the meeting payload'),
         triggered_for: z
           .array(z.enum(['my_recordings', 'shared_external_recordings', 'my_shared_with_team_recordings', 'shared_team_recordings']))
           .min(1)
@@ -399,7 +408,7 @@ export function createServer(client: FathomClient): McpServer {
     new ResourceTemplate('fathom://recordings/{recording_id}/transcript', { list: undefined }),
     { title: 'Meeting transcript', description: 'One meeting transcript, one line per speaker turn', mimeType: 'text/plain' },
     async (uri, { recording_id }) => {
-      const transcript = await client.getTranscript(resourceId(recording_id));
+      const transcript = await transcriptOf(resourceId(recording_id));
       return { contents: [{ uri: uri.href, mimeType: 'text/plain', text: transcript.map(e => formatTranscriptLine(e)).join('\n') }] };
     }
   );
