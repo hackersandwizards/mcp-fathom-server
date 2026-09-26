@@ -10,6 +10,7 @@ describe('format', () => {
     assert.equal(timestampToSeconds('01:02:03'), 3723);
     assert.equal(timestampToSeconds('00:05:32'), 332);
     assert.equal(timestampToSeconds('x'), null);
+    assert.equal(timestampToSeconds(''), null);
   });
 
   it('links transcript lines and keeps hours', () => {

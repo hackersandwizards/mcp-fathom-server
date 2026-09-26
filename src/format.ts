@@ -24,6 +24,7 @@ export function dateRangeBounds(range: DateRange, now = new Date()): { created_a
 
 /** Fathom sends "HH:MM:SS" transcript timestamps. */
 export function timestampToSeconds(timestamp: string): number | null {
+  if (!timestamp?.trim()) return null;
   const parts = timestamp.split(':').map(Number);
   if (parts.length > 3 || parts.some(Number.isNaN)) return null;
   return parts.reduce((total, part) => total * 60 + part, 0);
@@ -164,7 +165,11 @@ export function transcriptSnippets(meeting: Meeting, words: string[], max = 3): 
     .map(({ entry }) => formatTranscriptLine(entry, url));
 }
 
-/** `needle` is lowercase. Matches an invitee's name, email or matched transcript speaker name. */
+/** `needle` is lowercase. */
+export function anyIncludes(values: Array<string | null | undefined>, needle: string): boolean {
+  return values.some(value => value?.toLowerCase().includes(needle));
+}
+
 export function inviteeMatches(invitee: CalendarInvitee, needle: string): boolean {
-  return [invitee.name, invitee.email, invitee.matched_speaker_display_name].some(value => value?.toLowerCase().includes(needle));
+  return anyIncludes([invitee.name, invitee.email, invitee.matched_speaker_display_name], needle);
 }

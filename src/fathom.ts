@@ -1,6 +1,7 @@
 export const FATHOM_API_BASE_URL = 'https://api.fathom.ai/external/v1';
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RETRIES = 4;
+// A Retry-After longer than this fails fast instead of retrying before Fathom allows it.
 const MAX_RETRY_WAIT_MS = 30_000;
 // Retries stop once they would push one request past this, so a scan's last request cannot
 // carry a tool call past Claude Desktop's 240 s timeout.
@@ -135,7 +136,7 @@ function decodeCursor(cursor?: string): Position {
   return { s: Number(match[1]), c: match[2] || undefined };
 }
 
-function toError(status: number, raw: string, path: string): FathomApiError {
+function toError(status: number, raw: string, path: string, retries: number, retryAfter: number): FathomApiError {
   let detail = raw.slice(0, 300);
   try {
     const json = JSON.parse(raw);
@@ -149,7 +150,7 @@ function toError(status: number, raw: string, path: string): FathomApiError {
     401: 'Fathom rejected the API key (401). Check FATHOM_API_KEY.',
     403: `Fathom denied access to ${path} (403): ${detail}`,
     404: notFound,
-    429: `Fathom rate limit still exceeded after ${MAX_RETRIES} retries. The limit is 60 requests per minute, and 30 or fewer for summaries and transcripts. Wait a minute or narrow the request.`
+    429: `Fathom rate limit still exceeded after ${retries} retries${retryAfter > 0 ? `, and Fathom asks to wait ${retryAfter} s` : ''}. The limit is 60 requests per minute, and 30 or fewer for summaries and transcripts. Wait a minute or narrow the request.`
   };
   return new FathomApiError(messages[status] ?? `Fathom API error ${status} on ${path}: ${detail}`, status);
 }
@@ -193,14 +194,14 @@ export class FathomClient {
 
       const retryable = response.status === 429 || (method === 'GET' && response.status >= 500);
       const retryAfter = Number(response.headers.get('retry-after'));
-      const wait = Math.min(retryAfter > 0 ? retryAfter * 1000 : 1000 * 2 ** attempt, MAX_RETRY_WAIT_MS);
-      if (retryable && attempt < MAX_RETRIES && canWait(wait)) {
+      const wait = retryAfter > 0 ? retryAfter * 1000 : 1000 * 2 ** attempt;
+      if (retryable && attempt < MAX_RETRIES && wait <= MAX_RETRY_WAIT_MS && canWait(wait)) {
         console.error(`[fathom] ${response.status} on ${path}, retrying in ${wait} ms`);
         await this.sleep(wait);
         continue;
       }
 
-      if (!response.ok) throw toError(response.status, raw, path);
+      if (!response.ok) throw toError(response.status, raw, path, attempt, retryAfter);
       if (!raw) return undefined as T;
       try {
         return JSON.parse(raw) as T;
@@ -246,8 +247,12 @@ export class FathomClient {
     }
   }
 
-  private async all<T>(path: string, query: Query = {}): Promise<T[]> {
-    return (await this.collect<T>(path, query, Infinity)).items;
+  /** Every page, or an error: a silently partial list of names would read as complete. */
+  private async all<T>(path: string, query: Query = {}, deadline = Infinity): Promise<T[]> {
+    const result = await this.collect<T>(path, query, Infinity, undefined, () => Date.now() > deadline);
+    if (result.error) throw new FathomApiError(result.error);
+    if (result.next_cursor) throw new FathomApiError(`Stopped reading ${path} at the time limit after ${result.items.length} entries.`);
+    return result.items;
   }
 
   listMeetings(filters: MeetingFilters, limit: number, cursor?: string, stopAfter?: (meeting: Meeting) => boolean) {
@@ -268,8 +273,8 @@ export class FathomClient {
     return this.all<Team>('/teams');
   }
 
-  listTeamMembers(team?: string) {
-    return this.all<TeamMember>('/team_members', { team });
+  listTeamMembers(team?: string, deadline?: number) {
+    return this.all<TeamMember>('/team_members', { team }, deadline);
   }
 
   listMeetingTypes() {

@@ -119,4 +119,28 @@ describe('MCP server', () => {
     const { client } = await connect(() => new Response('', { status: 200 }));
     assert.equal(textOf(await client.callTool({ name: 'get_meeting_summary', arguments: { recording_id: 1 } })), 'This meeting has no summary.');
   });
+
+  it('downloads a transcript once while paging through it', async () => {
+    const transcript = Array.from({ length: 4 }, (_, i) => ({ speaker: { display_name: 'A', matched_calendar_invitee_email: null }, text: `t${i}`, timestamp: `00:00:0${i}` }));
+    const { client, calls } = await connect(() => ({ transcript }));
+    for (const start of [0, 2]) await client.callTool({ name: 'get_meeting_transcript', arguments: { recording_id: 1, start, max_entries: 2 } });
+    assert.equal(calls.length, 1);
+  });
+
+  it('flags a list cut short by a failing page', async () => {
+    const pages = pagedMeetings(Array.from({ length: 20 }, (_, i) => meeting(i + 1)));
+    const { client } = await connect(url => (url.searchParams.get('cursor') ? new Response('', { status: 401 }) : pages(url)));
+    const body = JSON.parse(textOf(await client.callTool({ name: 'list_meetings', arguments: { limit: 20 } })));
+    assert.equal(body.count, 10);
+    assert.match(body.error, /Stopped early/);
+  });
+
+  it('still finds invitees when the roster fails', async () => {
+    const meetings = [meeting(1, { calendar_invitees: [{ name: 'Jane Roe', email: 'jane@acme.com', email_domain: 'acme.com', is_external: true, matched_speaker_display_name: null }] })];
+    const pages = pagedMeetings(meetings);
+    const { client } = await connect(url => (url.pathname.endsWith('/team_members') ? new Response('', { status: 403 }) : pages(url)));
+    const body = JSON.parse(textOf(await client.callTool({ name: 'find_person', arguments: { name: 'jane' } })));
+    assert.equal(body.matches[0].email, 'jane@acme.com');
+    assert.match(body.roster_error, /403/);
+  });
 });

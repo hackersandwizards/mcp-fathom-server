@@ -1,9 +1,10 @@
 import { createRequire } from 'node:module';
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
-import { FathomClient, type Meeting, type MeetingFilters } from './fathom.js';
+import { FathomClient, type Meeting, type MeetingFilters, type TranscriptEntry } from './fathom.js';
 import {
   DATE_RANGES,
+  anyIncludes,
   SEARCH_FIELDS,
   dateRangeBounds,
   formatMeeting,
@@ -29,6 +30,7 @@ Base every statement about what was said or decided on a summary, transcript or 
 
 // Scans stop after this so the tool answers inside Claude Desktop's 240 s tool-call timeout.
 const SCAN_BUDGET_MS = 120_000;
+const TRANSCRIPT_CACHE_MS = 10 * 60_000;
 
 const READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 
@@ -76,6 +78,12 @@ function apiFilters({ date_range, ...filters }: Filters): MeetingFilters {
   };
 }
 
+type Includes = Pick<MeetingFilters, 'include_summary' | 'include_action_items' | 'include_highlights' | 'include_crm_matches'>;
+
+function splitIncludes<T extends Includes>({ include_summary, include_action_items, include_highlights, include_crm_matches, ...filters }: T) {
+  return { includes: { include_summary, include_action_items, include_highlights, include_crm_matches }, filters };
+}
+
 function resourceId(value: string | string[]): number {
   const id = Number(value);
   if (!Number.isInteger(id) || id <= 0) throw new Error(`Invalid recording_id: ${value}`);
@@ -88,6 +96,20 @@ function peopleKey(email: string | null, name: string | null): string {
 
 export function createServer(client: FathomClient): McpServer {
   const server = new McpServer({ name: 'mcp-fathom-server', version }, { instructions: INSTRUCTIONS });
+
+  // Paging through one transcript with `start` would otherwise re-download it for every page,
+  // and transcripts count against Fathom's tighter limit.
+  let lastTranscript: { id: number; at: number; entries: Promise<TranscriptEntry[]> } | undefined;
+  const transcriptOf = (id: number) => {
+    if (lastTranscript?.id !== id || Date.now() - lastTranscript.at > TRANSCRIPT_CACHE_MS) {
+      const entries = client.getTranscript(id);
+      entries.catch(() => {
+        if (lastTranscript?.entries === entries) lastTranscript = undefined;
+      });
+      lastTranscript = { id, at: Date.now(), entries };
+    }
+    return lastTranscript.entries;
+  };
 
   server.registerTool(
     'list_meetings',
@@ -104,11 +126,15 @@ export function createServer(client: FathomClient): McpServer {
       annotations: READ
     },
     async ({ limit, cursor, response_format, summary_max_chars, ...rest }) => {
-      const { include_summary, include_action_items, include_highlights, include_crm_matches, ...filters } = rest;
-      const includes = { include_summary, include_action_items, include_highlights, include_crm_matches };
-      const { items, next_cursor } = await client.listMeetings({ ...apiFilters(filters), ...includes }, limit, cursor);
+      const { includes, filters } = splitIncludes(rest);
+      const { items, next_cursor, error } = await client.listMeetings({ ...apiFilters(filters), ...includes }, limit, cursor);
       const options = { ...includes, summary_max_chars, detailed: response_format === 'detailed' };
-      return json({ count: items.length, meetings: items.map(m => formatMeeting(m, options)), next_cursor });
+      return json({
+        count: items.length,
+        meetings: items.map(m => formatMeeting(m, options)),
+        next_cursor,
+        ...(error ? { error: `Stopped early: ${error}` } : {})
+      });
     }
   );
 
@@ -137,16 +163,9 @@ export function createServer(client: FathomClient): McpServer {
     async ({ query, attendee, search_in, max_scan, limit, cursor, response_format, summary_max_chars, ...rest }) => {
       const words = queryWords(query ?? '');
       if (!words.length && !attendee) return fail('Give a query, an attendee, or both.');
-      const { include_summary, include_action_items, include_highlights, include_crm_matches, ...filters } = rest;
+      const { includes, filters } = splitIncludes(rest);
       const searched = words.length ? search_in : [];
-      const options = {
-        include_summary,
-        include_action_items,
-        include_highlights,
-        include_crm_matches,
-        summary_max_chars,
-        detailed: response_format === 'detailed'
-      };
+      const options = { ...includes, summary_max_chars, detailed: response_format === 'detailed' };
       const deadline = Date.now() + SCAN_BUDGET_MS;
       const matches: Array<Record<string, unknown>> = [];
       const collectMatch = (meeting: Meeting) => {
@@ -162,16 +181,18 @@ export function createServer(client: FathomClient): McpServer {
       const scan = await client.listMeetings(
         {
           ...apiFilters(filters),
-          include_summary: include_summary || searched.includes('summary'),
-          include_action_items: include_action_items || searched.includes('action_items'),
-          include_highlights: include_highlights || searched.includes('highlights'),
+          include_summary: includes.include_summary || searched.includes('summary'),
+          include_action_items: includes.include_action_items || searched.includes('action_items'),
+          include_highlights: includes.include_highlights || searched.includes('highlights'),
           include_transcript: searched.includes('transcript'),
-          include_crm_matches
+          include_crm_matches: includes.include_crm_matches
         },
         max_scan,
         cursor,
         meeting => {
           collectMatch(meeting);
+          // Only the count and the oldest date are read later, so drop the heavy fields now.
+          meeting.transcript = meeting.default_summary = meeting.action_items = meeting.highlights = meeting.crm_matches = null;
           return matches.length >= limit || Date.now() > deadline;
         }
       );
@@ -181,7 +202,7 @@ export function createServer(client: FathomClient): McpServer {
         total_matches: matches.length,
         meetings: matches,
         scanned: scan.items.length,
-        scanned_back_to: oldest ? oldest.created_at : null,
+        oldest_scanned_created_at: oldest ? oldest.created_at : null,
         next_cursor: scan.next_cursor,
         ...(scan.error ? { error: `Scan stopped early: ${scan.error}` } : {}),
         ...(scan.next_cursor ? { note: 'More meetings remain in the date range. Continue with next_cursor.' } : {})
@@ -219,7 +240,7 @@ export function createServer(client: FathomClient): McpServer {
       _meta: { 'anthropic/maxResultSizeChars': 500_000 }
     },
     async ({ recording_id, url, start, max_entries }) => {
-      const transcript = await client.getTranscript(recording_id);
+      const transcript = await transcriptOf(recording_id);
       if (!transcript.length) return text('This meeting has no transcript.');
       const entries = transcript.slice(start, start + max_entries);
       if (!entries.length) return fail(`start=${start} is past the end. The transcript has ${transcript.length} entries.`);
@@ -280,14 +301,18 @@ export function createServer(client: FathomClient): McpServer {
     },
     async ({ name, max_scan }) => {
       const deadline = Date.now() + SCAN_BUDGET_MS;
+      let rosterError: string | undefined;
       const [members, scan] = await Promise.all([
-        client.listTeamMembers(),
+        client.listTeamMembers(undefined, deadline).catch((error: Error) => {
+          rosterError = error.message;
+          return [];
+        }),
         client.listMeetings({}, max_scan, undefined, () => Date.now() > deadline)
       ]);
 
       const people = new Map<string, Record<string, unknown> & { meetings: number }>();
       for (const m of members) {
-        if (m.name?.toLowerCase().includes(name) || m.email?.toLowerCase().includes(name)) {
+        if (anyIncludes([m.name, m.email], name)) {
           people.set(peopleKey(m.email, m.name), { name: m.name, email: m.email, source: 'team', meetings: 0 });
         }
       }
@@ -306,7 +331,8 @@ export function createServer(client: FathomClient): McpServer {
       return json({
         matches: [...people.values()],
         scanned_meetings: scan.items.length,
-        ...(scan.error ? { error: `Scan stopped early: ${scan.error}` } : {})
+        ...(scan.error ? { error: `Scan stopped early: ${scan.error}` } : {}),
+        ...(rosterError ? { roster_error: `Team roster not searched: ${rosterError}` } : {})
       });
     }
   );

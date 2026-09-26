@@ -102,4 +102,10 @@ describe('FathomClient errors and retries', () => {
     const { client } = fakeApi(() => new Response('<html>proxy</html>', { status: 200 }));
     await assert.rejects(client.listTeams(), /not JSON.*proxy/);
   });
+
+  it('fails fast when Retry-After exceeds what it will wait', async () => {
+    const { client, calls } = fakeApi(() => new Response('', { status: 429, headers: { 'Retry-After': '45' } }));
+    await assert.rejects(client.listTeams(), /after 0 retries, and Fathom asks to wait 45 s/);
+    assert.equal(calls.length, 1);
+  });
 });
