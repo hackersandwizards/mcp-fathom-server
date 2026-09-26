@@ -93,10 +93,6 @@ function resourceId(value: string | string[]): number {
   return id;
 }
 
-function peopleKey(email: string | null, name: string | null): string {
-  return (email || name || '').toLowerCase();
-}
-
 export function createServer(client: FathomClient, index?: MeetingIndex): McpServer {
   const server = new McpServer({ name: 'mcp-fathom-server', version }, { instructions: INSTRUCTIONS });
 
@@ -393,24 +389,29 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
         coverage = { ...coverage, scanned_meetings: scan.items.length, ...(stopped ? { error: `Meeting scan stopped early: ${stopped}` } : {}) };
       }
 
-      const people = new Map<string, Record<string, unknown> & { meetings: number; spoke_in: number }>();
-      for (const m of await roster) {
-        if (anyIncludes([m.name, m.email], name)) {
-          people.set(peopleKey(m.email, m.name), { name: m.name, email: m.email, team_member: true, meetings: 0, spoke_in: 0 });
-        }
-      }
+      const members = (await roster).filter(m => anyIncludes([m.name, m.email], name));
       // Newest first, so the first meeting seen for a person is their latest.
-      for (const meeting of meetings) {
-        for (const p of meeting.people) {
-          if (!anyIncludes([p.name, p.email, ...(p.aliases ?? [])], name)) continue;
-          const key = peopleKey(p.email, p.name);
-          const person = people.get(key) ?? { name: p.name, email: p.email, meetings: 0, spoke_in: 0 };
-          person.external ??= p.external ?? undefined;
-          person.meetings += 1;
-          if (p.spoke) person.spoke_in += 1;
-          person.latest_meeting ??= { recording_id: meeting.recording_id, title: meeting.title, date: meeting.date, url: meetingUrl(meeting) };
-          people.set(key, person);
-        }
+      const seen = meetings.flatMap(meeting => meeting.people.filter(p => anyIncludes([p.name, p.email, ...(p.aliases ?? [])], name)).map(p => ({ meeting, p })));
+      // A name shown without an email, such as an unmatched speaker, joins the one email seen with that name.
+      const emailByName = new Map<string, string | null>();
+      for (const { name: n, email } of [...members, ...seen.map(({ p }) => p)]) {
+        if (!n || !email) continue;
+        const known = emailByName.get(n.toLowerCase());
+        emailByName.set(n.toLowerCase(), known === undefined || known === email.toLowerCase() ? email.toLowerCase() : null);
+      }
+      const keyOf = (email: string | null, n: string | null) => (email || (n && emailByName.get(n.toLowerCase())) || n || '').toLowerCase();
+
+      const people = new Map<string, Record<string, unknown> & { meetings: number; spoke_in: number }>();
+      for (const m of members) people.set(keyOf(m.email, m.name), { name: m.name, email: m.email, team_member: true, meetings: 0, spoke_in: 0 });
+      for (const { meeting, p } of seen) {
+        const key = keyOf(p.email, p.name);
+        const person = people.get(key) ?? { name: p.name, email: p.email, meetings: 0, spoke_in: 0 };
+        person.email ||= p.email;
+        person.external ??= p.external ?? undefined;
+        person.meetings += 1;
+        if (p.spoke) person.spoke_in += 1;
+        person.latest_meeting ??= { recording_id: meeting.recording_id, title: meeting.title, date: meeting.date, url: meetingUrl(meeting) };
+        people.set(key, person);
       }
       const matches = [...people.values()].sort((a, b) => b.meetings - a.meetings);
       return json({

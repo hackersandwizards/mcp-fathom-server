@@ -22,6 +22,7 @@ async function built(meetings = history()) {
   const pages = pagedMeetings(live);
   const api = fakeApi(url => {
     if (url.pathname.endsWith('/team_members')) return { items: [], next_cursor: null };
+    if (url.pathname.endsWith('/300/transcript')) return new Response('', { status: 404 });
     if (url.pathname.endsWith('/transcript')) return { transcript: [speaker('Late Speaker')] };
     const after = url.searchParams.get('created_after');
     return after ? { items: live.filter(m => m.created_at > after), next_cursor: null } : pages(url);
@@ -291,5 +292,37 @@ describe('MeetingIndex', () => {
     await mcp.connect(a);
     await mcp.callTool({ name: 'find_person', arguments: { name: 'rita' } });
     assert.ok(api.calls.some(c => c.url.pathname.endsWith('/meetings') && c.url.searchParams.get('include_transcript') === 'true'));
+  });
+
+  it('finishes a re-walk when a new meeting has no readable transcript', async () => {
+    const { index, live } = await built();
+    live.splice(5, 0, meeting(300, { created_at: '2026-01-24T12:00:00Z' }));
+    (index as unknown as { startWalk: () => void }).startWalk();
+    await index.backfill();
+    assert.equal(index.findByLink('/calls/300')?.recording_id, 300);
+    assert.equal(index.size, 26);
+  });
+
+  it('gives up waiting for a busy index at the time limit', async () => {
+    const { index } = await built();
+    void (index as unknown as { serial: (work: () => Promise<unknown>) => Promise<unknown> }).serial(() => new Promise(resolve => setTimeout(resolve, 1000)));
+    const started = Date.now();
+    assert.match((await index.freshen(Date.now() + 50, true))!, /busy/);
+    assert.ok(Date.now() - started < 500);
+  });
+
+  it('counts a speaker without an email under the invitee with the same name', async () => {
+    const invited = meeting(1, {
+      created_at: '2026-01-02T10:00:00Z',
+      calendar_invitees: [{ name: 'Anna Schmidt', email: 'anna@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: null }]
+    });
+    const spoke = meeting(2, { created_at: '2026-01-03T10:00:00Z', transcript: [speaker('Anna Schmidt')] });
+    const { index, client } = await built([spoke, invited]);
+    const mcp = await connect(client, index);
+    const { matches } = body(await mcp.callTool({ name: 'find_person', arguments: { name: 'anna', max_scan: 10 } }));
+    assert.equal(matches.length, 1);
+    assert.equal(matches[0].email, 'anna@x.com');
+    assert.equal(matches[0].meetings, 2);
+    assert.equal(matches[0].latest_meeting.recording_id, 2);
   });
 });

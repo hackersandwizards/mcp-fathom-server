@@ -183,7 +183,11 @@ export class MeetingIndex {
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           await link(temp, this.lockPath);
-          if (!this.exitHooked) process.once('exit', () => this.releaseLock());
+          if (!this.exitHooked) {
+            process.once('exit', () => this.releaseLock());
+            // Keeps the lock fresh during long steps too, such as a catch-up sync after weeks offline.
+            setInterval(() => void this.heartbeat(), LOCK_STALE_MS / 3).unref();
+          }
           this.exitHooked = true;
           return (this.writer = true);
         } catch (error) {
@@ -265,7 +269,8 @@ export class MeetingIndex {
     const rewalk = this.state.complete;
     const page = await this.client.listMeetings({ include_transcript: !rewalk }, 10, this.state.backfill_cursor ?? undefined);
     if (rewalk) {
-      for (const m of page.items) if (!this.state.meetings[m.recording_id]) m.transcript = await this.client.getTranscript(m.recording_id);
+      // A transcript that cannot be read leaves the invitees, rather than stalling the walk on this page.
+      for (const m of page.items) if (!this.state.meetings[m.recording_id]) m.transcript = await this.client.getTranscript(m.recording_id).catch(() => []);
     }
     this.add(page.items);
     if (!this.state.backfill_cursor && page.items[0]) this.raiseWatermark(page.items[0].created_at);
@@ -279,7 +284,7 @@ export class MeetingIndex {
       this.state.complete = true;
       this.state.completed_at = new Date().toISOString();
     }
-    if (this.state.complete || ++this.pagesSinceSave >= SAVE_EVERY_PAGES) await this.save();
+    if (!page.next_cursor || ++this.pagesSinceSave >= SAVE_EVERY_PAGES) await this.save();
   }
 
   /**
@@ -325,9 +330,10 @@ export class MeetingIndex {
         await this.sleep(BACKFILL_PAUSE_MS);
       } catch (error) {
         // Keep the pages read since the last save, so a restart resumes from here.
-        await this.save().catch(() => {});
+        await this.serial(() => this.save()).catch(() => {});
         // A saved cursor Fathom or this server no longer accepts: walk again from the newest meeting.
-        if ((error as FathomApiError).status === 400 || /Invalid cursor/.test((error as Error).message)) this.startWalk();
+        const badCursor = (error as FathomApiError).status === 400 || /Invalid cursor/.test((error as Error).message);
+        if (badCursor && this.state.backfill_cursor) this.startWalk();
         if (this.handleLoopError(error) === 'stop') return false;
         await this.sleep(ERROR_PAUSE_MS);
       }
@@ -371,11 +377,16 @@ export class MeetingIndex {
     if (!this.writer) await this.load();
     if (!afterMiss && Date.now() - this.freshAt < FRESH_MS) return undefined;
     // Waits for the index step in progress, usually one page, unless the time limit passes first.
-    const sync = async () => {
-      if (Date.now() > deadline) throw new FathomApiError('the index was busy until the time limit.');
+    const busy = 'the index was busy until the time limit.';
+    const sync = this.serial(async () => {
+      if (Date.now() > deadline) throw new FathomApiError(busy);
       await this.forward(deadline, afterMiss ? REFRESH_OVERLAP_MS : 0, false);
-    };
-    return this.serial(sync).then(
+    });
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      if (Number.isFinite(deadline)) timer = setTimeout(() => reject(new FathomApiError(busy)), Math.max(0, deadline - Date.now())).unref();
+    });
+    return Promise.race([sync, timeout]).finally(() => clearTimeout(timer)).then(
       () => undefined,
       (error: Error) => `Newest meetings may be missing: ${error.message}`
     );
