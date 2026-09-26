@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { dateRangeBounds, formatMeeting, formatTranscriptLine, matchMeeting, timestampToSeconds, transcriptSnippets } from '../src/format.js';
+import { peopleOf, dateRangeBounds, formatMeeting, formatTranscriptLine, matchMeeting, timestampToSeconds, transcriptSnippets } from '../src/format.js';
 import { meeting } from './helpers.js';
 
 const entry = (timestamp: string, text: string) => ({ speaker: { display_name: 'Jane', matched_calendar_invitee_email: null }, text, timestamp });
@@ -49,5 +49,26 @@ describe('format', () => {
   it('ranks transcript snippets by matched words', () => {
     const m = meeting(1, { transcript: [entry('00:00:01', 'price only'), entry('00:00:02', 'price and renewal')] });
     assert.match(transcriptSnippets(m, ['price', 'renewal'])[0], /price and renewal/);
+  });
+
+  const speaker = (name: string) => ({ speaker: { display_name: name, matched_calendar_invitee_email: null }, text: 'hi', timestamp: '00:00:01' });
+
+  it('merges an invitee who spoke into one person', () => {
+    const m = meeting(1, {
+      calendar_invitees: [{ name: 'Alice Smith', email: 'alice@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: 'Alice S.' }],
+      transcript: [speaker('Alice S.'), speaker('Bob')]
+    });
+    assert.deepEqual(peopleOf(m), [
+      { name: 'Alice Smith', email: 'alice@x.com', external: true, invited: true, spoke: true, aliases: ['Alice S.'] },
+      { name: 'Bob', email: null, external: null, invited: false, spoke: true }
+    ]);
+  });
+
+  it('prefers a speaker name over an email shown as the invitee name', () => {
+    const m = meeting(1, {
+      calendar_invitees: [{ name: 'nb@x.com', email: 'nb@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: 'Niklas B' }],
+      transcript: [speaker('Niklas B')]
+    });
+    assert.deepEqual(peopleOf(m)[0], { name: 'Niklas B', email: 'nb@x.com', external: true, invited: true, spoke: true, aliases: ['nb@x.com'] });
   });
 });

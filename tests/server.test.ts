@@ -182,4 +182,47 @@ describe('MCP server', () => {
     const miss = await client.callTool({ name: 'find_meeting_by_link', arguments: { link: 'https://example.com/calls/1' } });
     assert.equal(miss.isError, true);
   });
+
+  const speaker = (name: string) => ({ speaker: { display_name: name, matched_calendar_invitee_email: null }, text: 'hi', timestamp: '00:00:01' });
+  const findPerson = async (meetings: ReturnType<typeof meeting>[], name: string) => {
+    const { client } = await connect(url => (url.pathname.endsWith('/team_members') ? { items: [], next_cursor: null } : pagedMeetings(meetings)(url)));
+    return JSON.parse(textOf(await client.callTool({ name: 'find_person', arguments: { name } }))).matches;
+  };
+
+  it('finds a person who only spoke, with the share URL of their latest meeting', async () => {
+    const matches = await findPerson([meeting(1), meeting(2, { transcript: [speaker('Rita Speaker')] })], 'rita');
+    assert.equal(matches[0].spoke_in, 1);
+    assert.equal(matches[0].latest_meeting.url, 'https://fathom.video/share/s2');
+  });
+
+  it('counts a speaker without an email under the invitee with the same name or alias', async () => {
+    const anna = await findPerson([
+      meeting(2, { transcript: [speaker('Anna Schmidt')] }),
+      meeting(1, { calendar_invitees: [{ name: 'Anna Schmidt', email: 'anna@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: null }] })
+    ], 'anna');
+    assert.deepEqual(anna.map((m: { email: string; meetings: number }) => [m.email, m.meetings]), [['anna@x.com', 2]]);
+    const bob = await findPerson([
+      meeting(2, { transcript: [speaker('Bob Smith')] }),
+      meeting(1, { calendar_invitees: [{ name: 'bob@x.com', email: 'bob@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: 'Bob Smith' }] })
+    ], 'bob');
+    assert.equal(bob.length, 1);
+    assert.equal(bob[0].meetings, 2);
+  });
+
+  it('counts a meeting once when two of its entries are the same person', async () => {
+    const matches = await findPerson([
+      meeting(2, { transcript: [speaker('Ben')], calendar_invitees: [{ name: 'Benedikt S', email: 'b@x.com', email_domain: 'x.com', is_external: false, matched_speaker_display_name: null }] }),
+      meeting(1, { calendar_invitees: [{ name: 'Benedikt S', email: 'b@x.com', email_domain: 'x.com', is_external: false, matched_speaker_display_name: 'Ben' }] })
+    ], 'ben');
+    assert.equal(matches.length, 1);
+    assert.equal(matches[0].meetings, 2);
+    assert.equal(matches[0].spoke_in, 1);
+  });
+
+  it('returns the detailed meeting for a link', async () => {
+    const { client } = await connect(pagedMeetings([meeting(1), meeting(2)]));
+    const found = JSON.parse(textOf(await client.callTool({ name: 'find_meeting_by_link', arguments: { link: 'https://fathom.video/share/s2' } })));
+    assert.equal(found.recording_id, 2);
+    assert.equal(found.recorded_by.email, 'rec@example.com');
+  });
 });

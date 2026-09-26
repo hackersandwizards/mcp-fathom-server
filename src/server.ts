@@ -2,11 +2,13 @@ import { createRequire } from 'node:module';
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
 import { FathomClient, type Meeting, type MeetingFilters, type TranscriptEntry } from './fathom.js';
-import { type IndexedMeeting, linkPath, type MeetingIndex, toIndexed } from './meeting-index.js';
 import {
   DATE_RANGES,
   anyIncludes,
+  linkPath,
+  meetingDate,
   meetingUrl,
+  peopleOf,
   SEARCH_FIELDS,
   dateRangeBounds,
   formatMeeting,
@@ -31,8 +33,6 @@ Base every statement about what was said or decided on a summary, transcript or 
 
 // Scans stop after this so the tool answers inside Claude Desktop's 240 s tool-call timeout.
 const SCAN_BUDGET_MS = 120_000;
-// The index sync before a lookup gets a short share of the time, so a fallback scan still fits.
-const FRESHEN_BUDGET_MS = 20_000;
 const TRANSCRIPT_CACHE_MS = 10 * 60_000;
 
 const READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
@@ -93,7 +93,7 @@ function resourceId(value: string | string[]): number {
   return id;
 }
 
-export function createServer(client: FathomClient, index?: MeetingIndex): McpServer {
+export function createServer(client: FathomClient): McpServer {
   const server = new McpServer({ name: 'mcp-fathom-server', version }, { instructions: INSTRUCTIONS });
 
   // Paging through one transcript with `start` would otherwise re-download it for every page,
@@ -215,10 +215,10 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
     {
       title: 'Find meeting by link',
       description:
-        'Resolve a pasted Fathom link (fathom.video/calls/<id> or fathom.video/share/<token>) or a bare call ID to its meeting, including recording_id and the public share URL. Looks it up in the local meeting index, or scans recent meetings when the index is off or incomplete.',
+        'Resolve a pasted Fathom link (fathom.video/calls/<id> or fathom.video/share/<token>) or a bare call ID to its meeting, including recording_id and the public share URL. Scans the most recent meetings, 10 per request.',
       inputSchema: z.object({
         link: z.string().trim().min(1).describe('A fathom.video/calls/ or /share/ URL, or the numeric call ID from a /calls/ URL'),
-        max_scan: z.number().int().min(10).max(500).default(200).describe('Recent meetings to scan when the index cannot answer')
+        max_scan: z.number().int().min(10).max(1000).default(300).describe('Recent meetings to scan')
       }),
       annotations: READ
     },
@@ -226,43 +226,15 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
       const path = /^\d+$/.test(link) ? `/calls/${link}` : linkPath(link);
       if (!path) return fail('Not a fathom.video /calls/ or /share/ link or a numeric call ID.');
       const deadline = Date.now() + SCAN_BUDGET_MS;
-      const result = (m: IndexedMeeting) => ({
-        recording_id: m.recording_id,
-        title: m.title,
-        date: m.date,
-        url: meetingUrl(m),
-        attendees: m.people.filter(p => p.invited).map(p => p.name || p.email)
-      });
-
-      let scanFilters: MeetingFilters = {};
-      let scanned = 'most recent meetings';
-      if (index) {
-        await index.load();
-        let hit = index.findByLink(path);
-        // Only a miss pays for a sync, which then runs even if the index synced a moment ago.
-        const warning = hit ? undefined : await index.freshen(Math.min(deadline, Date.now() + FRESHEN_BUDGET_MS), true);
-        hit ??= index.findByLink(path);
-        if (hit) return json(result(hit));
-        const { complete, oldest_indexed, indexed_meetings } = index.coverage();
-        // A complete index lacks only meetings shared after they were recorded, until its weekly
-        // re-walk. Those are most likely recent, so the scan covers the most recent meetings.
-        if (complete) scanned = `most recent meetings, nor among the ${indexed_meetings} meetings of the index`;
-        // A current, partial index already checked everything newer than its oldest meeting.
-        else if (!warning && oldest_indexed) {
-          scanFilters = { created_before: oldest_indexed };
-          scanned = `meetings older than the index (before ${oldest_indexed})`;
-        }
-      }
-
       let found: Meeting | undefined;
-      const scan = await client.listMeetings(scanFilters, max_scan, undefined, meeting => {
+      const scan = await client.listMeetings({}, max_scan, undefined, meeting => {
         if (linkPath(meeting.url) === path || linkPath(meeting.share_url) === path) found = meeting;
         return !!found || Date.now() > deadline;
       });
-      if (found) return json(result(toIndexed(found)));
+      if (found) return json(formatMeeting(found, { detailed: true }));
       const stopped = scan.error ?? (Date.now() > deadline ? 'time limit reached' : undefined);
       return fail(
-        `No meeting with this link among the ${scan.items.length} ${scanned}.${stopped ? ` Scan stopped early: ${stopped}.` : ''} Raise max_scan, or ask the user for the meeting title or date.`
+        `No meeting with this link among the ${scan.items.length} most recent meetings.${stopped ? ` Scan stopped early: ${stopped}.` : ''} Raise max_scan, or ask the user for the meeting date and use list_meetings with created_after and created_before.`
       );
     }
   );
@@ -349,10 +321,10 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
     {
       title: 'Find person',
       description:
-        'Find people by name or email fragment among meeting speakers, calendar invitees and the team roster. Returns email, whether they are external, how many meetings they joined or spoke in, and their latest meeting with its share URL. Searches the local meeting index (whole history) when it is enabled, otherwise the most recent meetings.',
+        'Find people by name or email fragment among meeting speakers, calendar invitees and the team roster. Returns email, whether they are external, how many of the scanned meetings they joined or spoke in, and their latest meeting with its share URL. Scans the most recent meetings with their transcripts.',
       inputSchema: z.object({
         name: z.string().trim().toLowerCase().min(1).describe('Name or email fragment, case-insensitive'),
-        max_scan: z.number().int().min(10).max(200).default(100).describe('Meetings to search in all when the index is off or still being built. Each 10 cost one transcript request.')
+        max_scan: z.number().int().min(10).max(200).default(100).describe('Recent meetings to search. Each 10 cost one of the 30 transcript requests Fathom allows per minute.')
       }),
       annotations: READ
     },
@@ -364,33 +336,15 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
         return [];
       });
 
-      let meetings: IndexedMeeting[] = [];
-      let coverage: Record<string, unknown> = {};
-      let toScan = max_scan;
-      let scanFilters: MeetingFilters = {};
-      if (index) {
-        const warning = await index.freshen(Math.min(deadline, Date.now() + FRESHEN_BUDGET_MS));
-        const indexCoverage = index.coverage();
-        const { complete, oldest_indexed, indexed_meetings } = indexCoverage;
-        meetings = index.meetings();
-        coverage = { index: indexCoverage, ...(warning ? { index_warning: warning } : {}) };
-        // A partial index is topped up with a scan of older meetings, up to max_scan in all.
-        toScan = complete ? 0 : Math.max(0, max_scan - indexed_meetings);
-        if (oldest_indexed) scanFilters = { created_before: oldest_indexed };
-      }
-      if (toScan) {
-        const scan = await client
-          // Transcripts name the speakers, as in the index.
-          .listMeetings({ ...scanFilters, include_transcript: true }, toScan, undefined, () => Date.now() > deadline)
-          .catch((error: Error) => ({ items: [] as Meeting[], error: error.message }));
-        meetings = [...meetings, ...scan.items.map(toIndexed)];
-        const stopped = scan.error ?? (scan.items.length < toScan && Date.now() > deadline ? 'time limit reached' : undefined);
-        coverage = { ...coverage, scanned_meetings: scan.items.length, ...(stopped ? { error: `Meeting scan stopped early: ${stopped}` } : {}) };
-      }
+      const scan = await client
+        // Transcripts name the speakers.
+        .listMeetings({ include_transcript: true }, max_scan, undefined, () => Date.now() > deadline)
+        .catch((error: Error) => ({ items: [] as Meeting[], error: error.message }));
+      const stopped = scan.error ?? (scan.items.length < max_scan && Date.now() > deadline ? 'time limit reached' : undefined);
 
       const members = (await roster).filter(m => anyIncludes([m.name, m.email], name));
       // Newest first, so the first meeting seen for a person is their latest.
-      const seen = meetings.flatMap(meeting => meeting.people.filter(p => anyIncludes([p.name, p.email, ...(p.aliases ?? [])], name)).map(p => ({ meeting, p })));
+      const seen = scan.items.flatMap(meeting => peopleOf(meeting).filter(p => anyIncludes([p.name, p.email, ...(p.aliases ?? [])], name)).map(p => ({ meeting, p })));
       // A name shown without an email, such as an unmatched speaker, joins the one email seen with that name.
       const emailByName = new Map<string, string | null>();
       const named = [...members.map(m => ({ names: [m.name], email: m.email })), ...seen.map(({ p }) => ({ names: [p.name, ...(p.aliases ?? [])], email: p.email }))];
@@ -417,14 +371,15 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
         if (!again) person.meetings += 1;
         if (p.spoke && !(again && last.spoke)) person.spoke_in += 1;
         counted.set(key, { id: meeting.recording_id, spoke: p.spoke || (again && last.spoke) });
-        person.latest_meeting ??= { recording_id: meeting.recording_id, title: meeting.title, date: meeting.date, url: meetingUrl(meeting) };
+        person.latest_meeting ??= { recording_id: meeting.recording_id, title: meeting.title || meeting.meeting_title, date: meetingDate(meeting), url: meetingUrl(meeting) };
         people.set(key, person);
       }
       const matches = [...people.values()].sort((a, b) => b.meetings - a.meetings);
       return json({
         matches: matches.slice(0, 25),
         ...(matches.length > 25 ? { note: `${matches.length - 25} more people match. Use a longer name fragment.` } : {}),
-        ...coverage,
+        scanned_meetings: scan.items.length,
+        ...(stopped ? { error: `Meeting scan stopped early: ${stopped}` } : {}),
         ...(rosterError ? { roster_error: `Team roster not searched: ${rosterError}` } : {})
       });
     }

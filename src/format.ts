@@ -173,3 +173,57 @@ export function anyIncludes(values: Array<string | null | undefined>, needle: st
 export function inviteeMatches(invitee: CalendarInvitee, needle: string): boolean {
   return anyIncludes([invitee.name, invitee.email, invitee.matched_speaker_display_name], needle);
 }
+
+export interface Person {
+  name: string | null;
+  email: string | null;
+  external: boolean | null;
+  invited: boolean;
+  spoke: boolean;
+  /** Other names Fathom shows for this person, such as the speaker name matched to an invitee. */
+  aliases?: string[];
+}
+
+/** The /calls/<id> or /share/... path of a fathom.video URL, or null. */
+export function linkPath(value: string | null | undefined): string | null {
+  try {
+    const raw = value ?? '';
+    const url = new URL(/^[a-z]+:\/\//i.test(raw) ? raw : raw.startsWith('/') ? `https://fathom.video${raw}` : `https://${raw}`);
+    if (!/(^|\.)fathom\.video$/.test(url.hostname)) return null;
+    const path = url.pathname.replace(/\/+$/, '');
+    return /^\/(calls|share)\//.test(path) ? path : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Speakers (from the transcript) and invitees of one meeting, one entry per person. */
+export function peopleOf(meeting: Meeting): Person[] {
+  const people = new Map<string, Person>();
+  // Fathom links a speaker to an invitee by display name; unmatched speakers carry no email.
+  const inviteeBySpeaker = new Map<string, string>();
+  const add = (key: string, name: string | null, email: string | null, patch: Partial<Person>) => {
+    const person = people.get(key) ?? { name, email, external: null, invited: false, spoke: false };
+    // Fathom sometimes shows an invitee's email as their name; a real name seen later wins.
+    const better = !person.name || (person.name.includes('@') && !!name && !name.includes('@'));
+    const merged = { ...person, name: better ? name : person.name, email: person.email || email, ...patch };
+    for (const alias of [name, person.name]) {
+      if (alias && alias !== merged.name && !merged.aliases?.includes(alias)) merged.aliases = [...(merged.aliases ?? []), alias];
+    }
+    people.set(key, merged);
+  };
+  for (const invitee of meeting.calendar_invitees ?? []) {
+    const key = (invitee.email || invitee.name || invitee.matched_speaker_display_name || '').toLowerCase();
+    if (!key) continue;
+    add(key, invitee.name || invitee.matched_speaker_display_name, invitee.email, { external: invitee.is_external, invited: true });
+    if (invitee.matched_speaker_display_name) add(key, invitee.matched_speaker_display_name, null, {});
+    for (const alias of [invitee.matched_speaker_display_name, invitee.name]) if (alias) inviteeBySpeaker.set(alias.toLowerCase(), key);
+  }
+  for (const { speaker } of meeting.transcript ?? []) {
+    if (!speaker) continue;
+    const byName = speaker.display_name?.toLowerCase();
+    const key = speaker.matched_calendar_invitee_email?.toLowerCase() || (byName && inviteeBySpeaker.get(byName)) || byName;
+    if (key) add(key, speaker.display_name, speaker.matched_calendar_invitee_email, { spoke: true });
+  }
+  return [...people.values()];
+}
