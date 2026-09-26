@@ -18,5 +18,7 @@ if (process.env.FATHOM_INDEX !== 'off') {
   // The loop logs and retries its own errors, such as an unwritable cache directory; tools fall back to scans.
   void index.run();
 }
+// Exit through process.exit on these signals too, so the index lock is released.
+for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => process.exit(0));
 serveStdio(() => createServer(client, index));
 console.error('Fathom MCP server running on stdio');

@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
@@ -69,7 +69,7 @@ describe('MeetingIndex', () => {
     const mcp = await connect(client, index);
     const before = calls.length;
     assert.equal(body(await mcp.callTool({ name: 'find_meeting_by_link', arguments: { link: 'https://fathom.video/calls/25' } })).recording_id, 25);
-    assert.equal(calls.length, before + 1, 'one refresh request, no scan');
+    assert.equal(calls.length, before, 'a hit needs no request');
     live.unshift(meeting(100, { created_at: '2026-02-01T10:00:00Z' }));
     assert.equal(body(await mcp.callTool({ name: 'find_meeting_by_link', arguments: { link: '100' } })).recording_id, 100);
     const miss = await mcp.callTool({ name: 'find_meeting_by_link', arguments: { link: '999' } });
@@ -144,7 +144,6 @@ describe('MeetingIndex', () => {
     const { path } = await built();
     const other = new MeetingIndex(fakeApi(() => ({})).client, path);
     const lockPath = `${path}.lock`;
-    const { writeFile } = await import('node:fs/promises');
     await writeFile(lockPath, String(process.ppid));
     assert.equal(await other.lock(), false);
   });
@@ -190,5 +189,60 @@ describe('MeetingIndex', () => {
       transcript: [speaker('Niklas B')]
     });
     assert.deepEqual(peopleOf(m)[0], { name: 'Niklas B', email: 'nb@x.com', external: true, invited: true, spoke: true, aliases: ['nb@x.com'] });
+  });
+
+  it('takes over a lock its writer stopped touching, even if the pid runs', async () => {
+    const { path } = await built();
+    const lockPath = `${path}.lock`;
+    await writeFile(lockPath, String(process.ppid));
+    const old = new Date(Date.now() - 60 * 60_000);
+    await utimes(lockPath, old, old);
+    assert.equal(await new MeetingIndex(fakeApi(() => ({})).client, path).lock(), true);
+  });
+
+  it('picks up the first meeting of an empty history', async () => {
+    const { index, live } = await built([]);
+    live.push(meeting(1));
+    assert.equal(await index.freshen(Infinity, 0), undefined);
+    assert.equal(index.size, 1);
+  });
+
+  it('lets a reader add new meetings in memory without writing the file', async () => {
+    const { path, live, client } = await built();
+    const reader = new MeetingIndex(client, path, async () => {});
+    const before = (await stat(path)).mtimeMs;
+    live.unshift(meeting(100, { created_at: '2026-02-01T10:00:00Z' }));
+    const mcp = await connect(client, reader);
+    const hit = body(await mcp.callTool({ name: 'find_meeting_by_link', arguments: { link: '100' } }));
+    assert.equal(hit.recording_id, 100);
+    assert.deepEqual(hit.attendees, []);
+    assert.equal((await stat(path)).mtimeMs, before);
+  });
+
+  it('syncs a tool call from the newest meeting without overlap, and at most once a minute', async () => {
+    const { index, calls } = await built();
+    await index.freshen(Infinity);
+    await index.freshen(Infinity);
+    const syncs = calls.filter(c => c.url.searchParams.get('created_after'));
+    assert.equal(syncs.length, 1);
+    assert.equal(syncs[0].url.searchParams.get('created_after'), '2026-01-30T10:00:00.000Z');
+  });
+
+  it('stops the loop when the cache directory cannot be created', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'fathom-index-'));
+    await writeFile(join(dir, 'file'), '');
+    const index = new MeetingIndex(fakeApi(() => ({})).client, join(dir, 'file', 'index.json'), async () => {});
+    await index.run();
+    assert.equal(index.size, 0);
+  });
+
+  it('scans with transcripts when the index cannot answer, so speakers are found', async () => {
+    const api = fakeApi(() => ({ items: [], next_cursor: null }));
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    await createServer(api.client).connect(b);
+    const mcp = new Client({ name: 'test', version: '1.0.0' });
+    await mcp.connect(a);
+    await mcp.callTool({ name: 'find_person', arguments: { name: 'rita' } });
+    assert.ok(api.calls.some(c => c.url.pathname.endsWith('/meetings') && c.url.searchParams.get('include_transcript') === 'true'));
   });
 });

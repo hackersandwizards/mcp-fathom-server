@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, unlinkSync } from 'node:fs';
-import { link, mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { link, mkdir, readFile, rename, stat, unlink, utimes, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { FathomApiError, type FathomClient, type Meeting } from './fathom.js';
+import { meetingDate } from './format.js';
 
 // Backfill reads one page of 10 transcripts, then pauses, so it uses about half of Fathom's
 // transcript budget (30 per minute) and leaves the rest for interactive tool calls.
@@ -11,6 +12,11 @@ const BACKFILL_PAUSE_MS = 4_000;
 const ERROR_PAUSE_MS = 60_000;
 const IDLE_MS = 60_000;
 const LOCK_RETRY_MS = 5 * 60_000;
+// The writer touches the lock at least every few minutes. An older lock is stale even when its pid
+// runs, since after a reboot that pid can belong to an unrelated process.
+const LOCK_STALE_MS = 15 * 60_000;
+// A tool call skips its sync when the index was synced this recently, unless it missed.
+const FRESH_MS = 60_000;
 const SAVE_EVERY_PAGES = 10;
 // The background loop fetches new meetings this often, without a time limit, so gaps close.
 const FORWARD_EVERY_MS = 10 * 60_000;
@@ -108,7 +114,7 @@ export function toIndexed(m: Meeting): IndexedMeeting {
   return {
     recording_id: m.recording_id,
     title: m.title || m.meeting_title || '',
-    date: m.scheduled_start_time || m.created_at,
+    date: meetingDate(m),
     created_at: m.created_at,
     url: m.url,
     share_url: m.share_url,
@@ -132,6 +138,8 @@ export class MeetingIndex {
   private writer = false;
   private loadedMtime = 0;
   private pagesSinceSave = 0;
+  private freshAt = 0;
+  private exitHooked = false;
   private sorted: IndexedMeeting[] | null = null;
   private byLink: Map<string, IndexedMeeting> | null = null;
 
@@ -155,6 +163,7 @@ export class MeetingIndex {
         this.state = saved;
         this.loadedMtime = mtimeMs;
         this.sorted = this.byLink = null;
+        this.freshAt = 0;
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') console.error(`[index] Could not read ${this.path}: ${(error as Error).message}`);
@@ -172,13 +181,15 @@ export class MeetingIndex {
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           await link(temp, this.lockPath);
-          if (!attempt) process.once('exit', () => this.releaseLock());
+          if (!this.exitHooked) process.once('exit', () => this.releaseLock());
+          this.exitHooked = true;
           return (this.writer = true);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
           const pid = Number(await readFile(this.lockPath, 'utf8').catch(() => ''));
           if (pid === process.pid) return (this.writer = true);
-          if (isAlive(pid)) return false;
+          const age = Date.now() - ((await stat(this.lockPath).catch(() => null))?.mtimeMs ?? 0);
+          if (isAlive(pid) && age < LOCK_STALE_MS) return false;
           await unlink(this.lockPath).catch(() => {});
         }
       }
@@ -192,6 +203,11 @@ export class MeetingIndex {
     try {
       if (readFileSync(this.lockPath, 'utf8') === String(process.pid)) unlinkSync(this.lockPath);
     } catch {}
+  }
+
+  private async heartbeat(): Promise<void> {
+    const now = new Date();
+    if (this.writer) await utimes(this.lockPath, now, now).catch(() => {});
   }
 
   /** Runs index work one step at a time, so the loop and a tool call never interleave. */
@@ -241,6 +257,7 @@ export class MeetingIndex {
 
   /** Reads one page of the history walk, newest to oldest. */
   private async walkPage(): Promise<void> {
+    await this.heartbeat();
     const page = await this.client.listMeetings({ include_transcript: true }, 10, this.state.backfill_cursor ?? undefined);
     this.add(page.items);
     if (!this.state.backfill_cursor && page.items[0]) this.raiseWatermark(page.items[0].created_at);
@@ -257,29 +274,36 @@ export class MeetingIndex {
   }
 
   /**
-   * Adds meetings created since the newest indexed one, re-reading a day of overlap.
+   * Adds meetings created since the newest indexed one. The background sync re-reads a day of
+   * overlap and records its time. A tool call reads only newer meetings and saves only what it adds.
    * The watermark moves only after every page arrived, so a cut-short sync leaves no gap.
    */
-  private async forward(deadline: number): Promise<void> {
+  private async forward(deadline: number, background: boolean): Promise<void> {
     const newest = this.state.newest_created_at;
-    if (!newest) return;
-    const since = new Date(Date.parse(newest) - REFRESH_OVERLAP_MS).toISOString();
-    const page = await this.client.listMeetings({ created_after: since, include_transcript: true }, Infinity, undefined, () => Date.now() > deadline);
+    // An empty index is current only once a completed walk found no meetings at all.
+    if (!newest && !this.state.complete) return;
+    const since = newest && new Date(Date.parse(newest) - (background ? REFRESH_OVERLAP_MS : 0)).toISOString();
+    const page = await this.client.listMeetings({ created_after: since || undefined, include_transcript: true }, Infinity, undefined, () => Date.now() > deadline);
     this.add(page.items);
     if (page.error || page.next_cursor) {
       await this.save();
       throw new FathomApiError(page.error ?? 'Stopped at the time limit.');
     }
     for (const m of page.items) this.raiseWatermark(m.created_at);
-    this.state.forward_synced_at = new Date().toISOString();
-    await this.save();
+    this.freshAt = Date.now();
+    if (background) this.state.forward_synced_at = new Date().toISOString();
+    if (background || page.items.length) await this.save();
   }
 
   private handleLoopError(error: unknown): 'stop' | 'continue' {
     const message = (error as Error).message;
     const status = error instanceof FathomApiError ? error.status : undefined;
+    // A file system error, such as an unwritable cache directory, does not heal by waiting.
+    if (status === 401 || (error as NodeJS.ErrnoException).code) {
+      console.error(`[index] Stopped: ${message}`);
+      return 'stop';
+    }
     console.error(`[index] Paused: ${message}`);
-    if (status === 401) return 'stop';
     // A saved cursor Fathom or this server no longer accepts: walk again from the newest meeting.
     if (status === 400 || /Invalid cursor/.test(message)) this.startWalk();
     return 'continue';
@@ -306,6 +330,7 @@ export class MeetingIndex {
     const age = (iso?: string) => (iso ? Date.now() - Date.parse(iso) : Infinity);
     while (!this.stopped) {
       try {
+        await this.heartbeat();
         if (!this.writer && !(await this.lock())) {
           await this.sleep(LOCK_RETRY_MS);
           await this.load();
@@ -317,7 +342,7 @@ export class MeetingIndex {
           if (!this.state.complete) continue;
           console.error(`[index] Complete: ${this.size} meetings`);
         }
-        if (age(this.state.forward_synced_at) > FORWARD_EVERY_MS) await this.serial(() => this.forward(Infinity));
+        if (age(this.state.forward_synced_at) > FORWARD_EVERY_MS) await this.serial(() => this.forward(Infinity, true));
         await this.sleep(IDLE_MS);
       } catch (error) {
         if (this.handleLoopError(error) === 'stop') return;
@@ -327,16 +352,15 @@ export class MeetingIndex {
   }
 
   /**
-   * Brings the index as close to current as one tool call allows. Returns a warning when the
-   * newest meetings may be missing: the loop is busy, the sync failed, or this process only reads.
+   * Brings the index as close to current as one tool call allows. A process that does not hold the
+   * lock reloads the file and adds newer meetings in memory only. Returns a warning when the newest
+   * meetings may be missing: the loop is busy or the sync failed.
    */
-  async freshen(deadline: number): Promise<string | undefined> {
-    if (!this.writer) {
-      await this.load();
-      return 'Another server process maintains the index, so meetings from the last minutes may be missing.';
-    }
+  async freshen(deadline: number, maxAgeMs = FRESH_MS): Promise<string | undefined> {
+    if (!this.writer) await this.load();
     if (this.busy) return 'The index is being updated, so meetings from the last minutes may be missing.';
-    return this.serial(() => this.forward(deadline)).then(
+    if (Date.now() - this.freshAt < maxAgeMs) return undefined;
+    return this.serial(() => this.forward(deadline, false)).then(
       () => undefined,
       (error: Error) => `Newest meetings may be missing: ${error.message}`
     );

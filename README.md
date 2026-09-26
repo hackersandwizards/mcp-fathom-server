@@ -29,8 +29,8 @@ The Fathom API has no speaker index and no link lookup. So the server builds its
 
 - **Where:** `~/.cache/mcp-fathom-server/index-<key id>.json` (or under `$XDG_CACHE_HOME`), one file per API key, readable only by you.
 - **Building it:** on first start the server reads the history once in the background, 10 meetings with transcripts every few seconds. That uses about half of Fathom's transcript rate limit, so tool calls keep working. An interrupted build resumes where it stopped. Until it finishes, both tools report how far back the index reaches.
-- **Keeping it current:** a background loop fetches new meetings every 10 minutes, re-reading one day of overlap so late transcripts fill in. Each `find_person` or `find_meeting_by_link` call also fetches new meetings first, within its time limit. Once a week the loop walks the whole history again, which adds meetings shared with you later and drops deleted ones.
-- **Several sessions:** one server process per API key holds a lock file and writes the index. Other processes read the file when it changes and take over the lock when the writer exits.
+- **Keeping it current:** a background loop fetches new meetings every 10 minutes, re-reading one day of overlap so late transcripts fill in. `find_person` also fetches new meetings first, at most once a minute. `find_meeting_by_link` does so when the link is not in the index yet. Once a week the loop walks the whole history again, which adds meetings shared with you later and drops deleted ones.
+- **Several sessions:** one server process per API key holds a lock file and writes the index. Other processes read the file when it changes and fetch newer meetings into memory. They take over the lock when the writer exits, or when it has not touched the lock for 15 minutes.
 - **No writable cache:** the server still starts. Both tools then scan recent meetings, as with the index off.
 - **Turning it off:** set `FATHOM_INDEX=off`. Both tools then scan recent meetings instead, and nothing is written to disk.
 
