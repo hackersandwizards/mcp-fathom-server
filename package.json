@@ -28,7 +28,7 @@
     "meetings",
     "ai"
   ],
-  "author": "Hackers and Wizards",
+  "author": "hackers&wizards",
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/server": "2.1.0",
