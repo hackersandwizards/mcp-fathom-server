@@ -29,7 +29,8 @@ The Fathom API has no speaker index and no link lookup. So the server builds its
 
 - **Where:** `~/.cache/mcp-fathom-server/index-<key id>.json` (or under `$XDG_CACHE_HOME`), one file per API key, readable only by you.
 - **Building it:** on first start the server reads the history once in the background, 10 meetings with transcripts every few seconds. That uses about half of Fathom's transcript rate limit, so tool calls keep working. An interrupted build resumes where it stopped. Until it finishes, both tools report how far back the index reaches.
-- **Keeping it current:** each `find_person` or `find_meeting_by_link` call first fetches meetings newer than the index, usually one request.
+- **Keeping it current:** each `find_person` or `find_meeting_by_link` call first fetches meetings from the last day before the newest indexed one onwards, usually one request, so late transcripts fill in. Once a week the server walks the history again for older meetings that were shared with you later.
+- **Several sessions:** one server process per API key holds a lock file and writes the index. Other processes read it and do not start a second backfill.
 - **Turning it off:** set `FATHOM_INDEX=off`. Both tools then scan recent meetings instead, and nothing is written to disk.
 
 ## Limits of the Fathom API
