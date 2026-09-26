@@ -43,7 +43,7 @@ export interface IndexedMeeting {
 }
 
 interface State {
-  version: 1;
+  version: 2;
   newest_created_at: string | null;
   backfill_cursor: string | null;
   complete: boolean;
@@ -53,7 +53,7 @@ interface State {
   meetings: Record<string, IndexedMeeting>;
 }
 
-const emptyState = (): State => ({ version: 1, newest_created_at: null, backfill_cursor: null, complete: false, meetings: {} });
+const emptyState = (): State => ({ version: 2, newest_created_at: null, backfill_cursor: null, complete: false, meetings: {} });
 
 export function defaultIndexPath(apiKey: string): string {
   const cache = process.env.XDG_CACHE_HOME || join(homedir(), '.cache');
@@ -81,8 +81,12 @@ export function peopleOf(meeting: Meeting): IndexedPerson[] {
   const inviteeBySpeaker = new Map<string, string>();
   const add = (key: string, name: string | null, email: string | null, patch: Partial<IndexedPerson>) => {
     const person = people.get(key) ?? { name, email, external: null, invited: false, spoke: false };
-    const merged = { ...person, name: person.name || name, email: person.email || email, ...patch };
-    if (name && merged.name !== name && !merged.aliases?.includes(name)) merged.aliases = [...(merged.aliases ?? []), name];
+    // Fathom sometimes shows an invitee's email as their name; a real name seen later wins.
+    const better = !person.name || (person.name.includes('@') && !!name && !name.includes('@'));
+    const merged = { ...person, name: better ? name : person.name, email: person.email || email, ...patch };
+    for (const alias of [name, person.name]) {
+      if (alias && alias !== merged.name && !merged.aliases?.includes(alias)) merged.aliases = [...(merged.aliases ?? []), alias];
+    }
     people.set(key, merged);
   };
   for (const invitee of meeting.calendar_invitees ?? []) {
@@ -146,7 +150,8 @@ export class MeetingIndex {
       const { mtimeMs } = await stat(this.path);
       if (mtimeMs === this.loadedMtime) return;
       const saved = JSON.parse(await readFile(this.path, 'utf8')) as State;
-      if (saved.version === 1) {
+      // An older format is rebuilt from scratch rather than migrated.
+      if (saved.version === 2) {
         this.state = saved;
         this.loadedMtime = mtimeMs;
         this.sorted = this.byLink = null;

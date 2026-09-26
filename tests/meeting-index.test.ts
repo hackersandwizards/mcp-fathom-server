@@ -183,4 +183,12 @@ describe('MeetingIndex', () => {
     const mcp = await connect(client, index);
     assert.equal(body(await mcp.callTool({ name: 'find_person', arguments: { name: 'bob', max_scan: 10 } })).matches[0].email, 'rob@x.com');
   });
+
+  it('prefers a speaker name over an email shown as the invitee name', () => {
+    const m = meeting(1, {
+      calendar_invitees: [{ name: 'nb@x.com', email: 'nb@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: 'Niklas B' }],
+      transcript: [speaker('Niklas B')]
+    });
+    assert.deepEqual(peopleOf(m)[0], { name: 'Niklas B', email: 'nb@x.com', external: true, invited: true, spoke: true, aliases: ['nb@x.com'] });
+  });
 });
