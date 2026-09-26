@@ -191,7 +191,7 @@ describe('MeetingIndex', () => {
     const { client, index, calls } = await built();
     const mcp = await connect(client, index);
     assert.equal((await mcp.callTool({ name: 'find_meeting_by_link', arguments: { link: '999' } })).isError, true);
-    assert.equal(calls.at(-1)!.url.searchParams.get('created_after'), '2026-01-29T10:00:00.000Z');
+    assert.ok(calls.some(c => c.url.searchParams.get('created_after') === '2026-01-29T10:00:00.000Z'));
   });
 
   it('stops the loop on a 401 after the first page of a sync', { timeout: 2000 }, async () => {
@@ -394,5 +394,13 @@ describe('MeetingIndex', () => {
     await forward();
     assert.deepEqual(calls.slice(before).map(c => c.url.searchParams.get('include_transcript')), ['false', 'true']);
     assert.match(await readFile(path, 'utf8'), /Zed Late/);
+  });
+
+  it('finds a meeting shared days after it was recorded, which the complete index lacks', async () => {
+    const { index, client, live } = await built();
+    // Created before the newest indexed meeting minus the day of overlap, so no sync lists it.
+    live.splice(3, 0, meeting(400, { created_at: '2026-01-27T12:00:00Z', transcript: [] }));
+    const mcp = await connect(client, index);
+    assert.equal(body(await mcp.callTool({ name: 'find_meeting_by_link', arguments: { link: '400' } })).recording_id, 400);
   });
 });

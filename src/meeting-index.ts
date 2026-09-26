@@ -168,11 +168,12 @@ export class MeetingIndex {
     try {
       const { mtimeMs } = await stat(this.path);
       if (mtimeMs === this.loadedMtime) return;
+      // An unreadable or older file is read again only once it changes.
+      this.loadedMtime = mtimeMs;
       const saved = JSON.parse(await readFile(this.path, 'utf8')) as State;
       // An older format is rebuilt from scratch rather than migrated.
       if (saved.version === 2) {
         this.state = saved;
-        this.loadedMtime = mtimeMs;
         this.sorted = this.byLink = null;
         this.freshAt = 0;
       }
@@ -192,6 +193,8 @@ export class MeetingIndex {
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           await link(temp, this.lockPath);
+          // A process that was writer before may hold a stale copy of what a later writer saved.
+          await this.load();
           return this.own();
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
@@ -287,7 +290,8 @@ export class MeetingIndex {
     const cursor = this.state.backfill_cursor ?? undefined;
     // A re-walk only learns which meetings exist. It re-reads a page with transcripts only when the
     // page holds a new meeting or one whose speakers are missing, like one page of the first build.
-    const rewalk = this.state.complete;
+    // A restarted first walk re-reads pages it already holds cheaply as well.
+    const rewalk = this.state.complete || (this.state.walk ?? 0) > 0;
     const page = await this.client.listMeetings({ include_transcript: !rewalk }, 10, cursor);
     this.add(page.items);
     if (rewalk && page.items.some(m => this.state.meetings[m.recording_id]?.speakers_missing)) {

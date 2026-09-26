@@ -244,13 +244,11 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
         hit ??= index.findByLink(path);
         if (hit) return json(result(hit));
         const { complete, oldest_indexed, indexed_meetings } = index.coverage();
-        if (!warning && complete) {
-          return fail(
-            `No meeting with this link among the ${indexed_meetings} meetings of the index, which covers the whole history and was just synced. A meeting shared with the user in the last week can still be missing: ask for its date and use list_meetings with created_after and created_before.`
-          );
-        }
-        // A current index already checked everything newer than its oldest meeting.
-        if (!warning && oldest_indexed) {
+        // A complete index lacks only meetings shared after they were recorded, until its weekly
+        // re-walk. Those are most likely recent, so the scan covers the most recent meetings.
+        if (complete) scanned = `most recent meetings, nor among the ${indexed_meetings} meetings of the index`;
+        // A current, partial index already checked everything newer than its oldest meeting.
+        else if (!warning && oldest_indexed) {
           scanFilters = { created_before: oldest_indexed };
           scanned = `meetings older than the index (before ${oldest_indexed})`;
         }
