@@ -10,6 +10,7 @@ Fathom also runs a hosted MCP server at `https://api.fathom.ai/mcp` with OAuth s
 |------|--------------|
 | `list_meetings` | Lists meetings newest first. Filters: date range, company domain, internal or external, meeting type, recorder, team. Adds summaries, action items, highlights or CRM matches on request. Pages with `next_cursor`. |
 | `search_meetings` | Finds meetings by keywords and by attendee name or email. Searches titles, summaries, action items, highlights and transcripts, and returns timestamped snippets for transcript hits. |
+| `find_meeting_by_link` | Resolves a pasted `fathom.video/calls/...` or `/share/...` link, or a call ID, to its meeting and share URL. |
 | `get_meeting_summary` | Returns one meeting's AI summary as Markdown. |
 | `get_meeting_transcript` | Returns one transcript, one line per speaker turn. With the meeting `url`, each timestamp links to that moment in the recording. Long transcripts page with `start`. |
 | `list_teams`, `list_team_members`, `list_meeting_types` | Return the exact names the filters expect. |
@@ -28,7 +29,7 @@ Every read tool is marked read-only, so clients can run it without asking. `dele
 - The API key sees the meetings its user recorded or that were shared with that user or their team.
 - Fathom cannot filter by a single attendee. `search_meetings` filters attendees locally.
 - Fathom has no endpoint to list webhooks, and shows a webhook's secret only once. `create_webhook` returns both, so store them.
-- The ID in a `fathom.video/calls/<id>` link is not the `recording_id` the API uses.
+- The ID in a `fathom.video/calls/<id>` link is not the `recording_id` the API uses, and the API has no lookup. `find_meeting_by_link` scans recent meetings for the link instead.
 
 ## Setup
 

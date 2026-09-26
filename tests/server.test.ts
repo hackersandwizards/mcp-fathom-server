@@ -23,7 +23,7 @@ describe('MCP server', () => {
     const destructive = tools.filter(t => t.annotations?.destructiveHint).map(t => t.name);
     assert.deepEqual(destructive, ['delete_webhook']);
     const readOnly = tools.filter(t => t.annotations?.readOnlyHint).map(t => t.name).sort();
-    assert.equal(readOnly.length, 8);
+    assert.equal(readOnly.length, 9);
   });
 
   it('searches transcripts across the whole scan and returns snippets', async () => {
@@ -170,5 +170,16 @@ describe('MCP server', () => {
     const { client } = await connect(() => ({ transcript: [] }));
     const result = await client.callTool({ name: 'get_meeting_transcript', arguments: { recording_id: 1, url: 'javascript:alert(1)' } });
     assert.equal(result.isError, true);
+  });
+
+  it('resolves a calls link, a share link and a call ID', async () => {
+    const meetings = Array.from({ length: 15 }, (_, i) => meeting(i + 1));
+    const { client } = await connect(pagedMeetings(meetings));
+    const resolve = async (link: string) => JSON.parse(textOf(await client.callTool({ name: 'find_meeting_by_link', arguments: { link } })));
+    assert.equal((await resolve('https://fathom.video/calls/12?timestamp=30')).recording_id, 12);
+    assert.equal((await resolve('fathom.video/share/s13/')).url, 'https://fathom.video/share/s13');
+    assert.equal((await resolve('14')).recording_id, 14);
+    const miss = await client.callTool({ name: 'find_meeting_by_link', arguments: { link: 'https://example.com/calls/1' } });
+    assert.equal(miss.isError, true);
   });
 });

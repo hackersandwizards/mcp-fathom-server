@@ -22,7 +22,7 @@ export const INSTRUCTIONS = `Fathom meeting recordings, read through the Fathom 
 
 Base every statement about what was said or decided on a summary, transcript or search snippet from this server, never on a meeting title or on memory.
 
-- recording_id comes from list_meetings or search_meetings. The number in a fathom.video/calls/<id> link is a different ID.
+- recording_id comes from list_meetings or search_meetings. For a pasted fathom.video link or call ID, use find_meeting_by_link: the number in a /calls/<id> link is not a recording_id.
 - Look up exact names with list_teams, list_team_members and list_meeting_types before filtering by team, recorder or meeting type.
 - Fathom has no server-side search. search_meetings scans meetings page by page (10 per request, 60 requests per minute), so give it a date range when you can and continue with next_cursor.
 - Pass the meeting url to get_meeting_transcript to get timestamped links into the recording.
@@ -88,6 +88,19 @@ function resourceId(value: string | string[]): number {
   const id = Number(value);
   if (!Number.isInteger(id) || id <= 0) throw new Error(`Invalid recording_id: ${value}`);
   return id;
+}
+
+/** The /calls/<id> or /share/... path of a fathom.video URL, or null. */
+function linkPath(value: string | null | undefined): string | null {
+  try {
+    const raw = value ?? '';
+    const url = new URL(/^[a-z]+:\/\//i.test(raw) ? raw : raw.startsWith('/') ? `https://fathom.video${raw}` : `https://${raw}`);
+    if (!/(^|\.)fathom\.video$/.test(url.hostname)) return null;
+    const path = url.pathname.replace(/\/+$/, '');
+    return /^\/(calls|share)\//.test(path) ? path : null;
+  } catch {
+    return null;
+  }
 }
 
 function peopleKey(email: string | null, name: string | null): string {
@@ -208,6 +221,34 @@ export function createServer(client: FathomClient): McpServer {
         ...(scan.error ? { error: `Scan stopped early: ${scan.error}` } : {}),
         ...(scan.next_cursor ? { note: 'More meetings remain in the date range. Continue with next_cursor.' } : {})
       });
+    }
+  );
+
+  server.registerTool(
+    'find_meeting_by_link',
+    {
+      title: 'Find meeting by link',
+      description:
+        'Resolve a pasted Fathom link (fathom.video/calls/<id> or fathom.video/share/<token>) or a bare call ID to its meeting, including recording_id and the public share URL. The API has no lookup, so this scans recent meetings newest first.',
+      inputSchema: z.object({
+        link: z.string().trim().min(1).describe('A fathom.video/calls/ or /share/ URL, or the numeric call ID from a /calls/ URL'),
+        max_scan: z.number().int().min(10).max(500).default(200).describe('Recent meetings to scan')
+      }),
+      annotations: READ
+    },
+    async ({ link, max_scan }) => {
+      const path = /^\d+$/.test(link) ? `/calls/${link}` : linkPath(link);
+      if (!path) return fail('Not a fathom.video /calls/ or /share/ link or a numeric call ID.');
+      const deadline = Date.now() + SCAN_BUDGET_MS;
+      let found: Meeting | undefined;
+      const scan = await client.listMeetings({}, max_scan, undefined, meeting => {
+        if (linkPath(meeting.url) === path || linkPath(meeting.share_url) === path) found = meeting;
+        return !!found || Date.now() > deadline;
+      });
+      if (found) return json(formatMeeting(found, { detailed: true }));
+      return fail(
+        `No meeting with this link among the ${scan.items.length} most recent meetings.${scan.error ? ` Scan stopped early: ${scan.error}` : ''} Raise max_scan, or ask the user for the meeting title or date.`
+      );
     }
   );
 

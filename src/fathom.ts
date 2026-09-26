@@ -145,7 +145,7 @@ function toError(status: number, raw: string, path: string, retries: number, ret
     detail = typeof message === 'string' ? message : JSON.stringify(json).slice(0, 300);
   } catch {}
   const notFound = path.startsWith('/recordings/')
-    ? `Not found (404): ${path}. A recording_id must come from list_meetings or search_meetings. The number in a fathom.video/calls/<id> link is a different ID.`
+    ? `Not found (404): ${path}. A recording_id must come from list_meetings, search_meetings or find_meeting_by_link. The number in a fathom.video/calls/<id> link is a different ID.`
     : `Not found (404): ${path}. ${detail}`;
   const messages: Record<number, string> = {
     401: 'Fathom rejected the API key (401). Check FATHOM_API_KEY.',
