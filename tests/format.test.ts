@@ -1,50 +1,45 @@
 import { describe, it } from 'node:test';
-import { strict as assert } from 'node:assert';
-import { formatMeeting } from '../src/utils/format.js';
-import type { FathomMeeting } from '../src/types.js';
+import assert from 'node:assert/strict';
+import { dateRangeBounds, formatMeeting, formatTranscriptLine, matchMeeting, timestampToSeconds, transcriptSnippets } from '../src/format.js';
+import { meeting } from './helpers.js';
 
-function meeting(overrides: Partial<FathomMeeting>): FathomMeeting {
-  return {
-    title: 'Test',
-    meeting_title: null,
-    recording_id: 1,
-    url: 'https://app.fathom.video/calls/123',
-    share_url: 'https://fathom.video/share/abc',
-    created_at: '2026-01-01T00:00:00Z',
-    scheduled_start_time: '2026-01-01T00:00:00Z',
-    scheduled_end_time: '2026-01-01T01:00:00Z',
-    recording_start_time: '2026-01-01T00:00:00Z',
-    recording_end_time: '2026-01-01T01:00:00Z',
-    calendar_invitees_domains_type: 'only_internal',
-    transcript_language: 'en',
-    calendar_invitees: [],
-    recorded_by: { name: 'You', email: 'you@example.com', email_domain: 'example.com', team: null },
-    transcript: null,
-    default_summary: null,
-    action_items: null,
-    crm_matches: null,
-    ...overrides
-  };
-}
+const entry = (timestamp: string, text: string) => ({ speaker: { display_name: 'Jane', matched_calendar_invitee_email: null }, text, timestamp });
 
-describe('formatMeeting URL preference', () => {
-  it('prefers share_url over url when both are present', () => {
-    const result = formatMeeting(meeting({}));
-    assert.equal(result.url, 'https://fathom.video/share/abc');
+describe('format', () => {
+  it('parses HH:MM:SS timestamps', () => {
+    assert.equal(timestampToSeconds('01:02:03'), 3723);
+    assert.equal(timestampToSeconds('00:05:32'), 332);
+    assert.equal(timestampToSeconds('x'), null);
   });
 
-  it('falls back to url when share_url is missing', () => {
-    const result = formatMeeting(meeting({ share_url: '' as unknown as string }));
-    assert.equal(result.url, 'https://app.fathom.video/calls/123');
+  it('links transcript lines and keeps hours', () => {
+    assert.equal(formatTranscriptLine(entry('00:05:32', 'Hi'), 'https://f.test/share/a'), '[05:32](https://f.test/share/a?timestamp=332) Jane: Hi');
+    assert.equal(formatTranscriptLine(entry('01:00:01', 'Hi')), '[1:00:01] Jane: Hi');
   });
 
-  it('uses share_url in brief mode too', () => {
-    const result = formatMeeting(meeting({}), { briefMode: true });
-    assert.equal(result.url, 'https://fathom.video/share/abc');
+  it('computes yesterday in local time', () => {
+    const now = new Date(2026, 8, 26, 15, 0);
+    const { created_after, created_before } = dateRangeBounds('yesterday', now);
+    assert.equal(created_after, new Date(2026, 8, 25).toISOString());
+    assert.equal(created_before, new Date(2026, 8, 26).toISOString());
   });
 
-  it('brief mode falls back to url when share_url empty', () => {
-    const result = formatMeeting(meeting({ share_url: '' as unknown as string }), { briefMode: true });
-    assert.equal(result.url, 'https://app.fathom.video/calls/123');
+  it('prefers the public share URL and lists attendee names in concise mode', () => {
+    const m = meeting(1, { calendar_invitees: [{ name: 'Ann', email: 'a@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: null }] });
+    const out = formatMeeting(m);
+    assert.equal(out.url, 'https://fathom.video/share/s1');
+    assert.deepEqual(out.attendees, ['Ann']);
+    assert.equal(out.duration_minutes, 45);
+  });
+
+  it('matches all words across fields and reports where', () => {
+    const m = meeting(1, { title: 'Acme sync', default_summary: { template_name: null, markdown_formatted: 'Budget approved' } });
+    assert.deepEqual(matchMeeting(m, ['acme', 'budget'], ['title', 'summary']), ['title', 'summary']);
+    assert.equal(matchMeeting(m, ['acme', 'budget'], ['title']), null);
+  });
+
+  it('ranks transcript snippets by matched words', () => {
+    const m = meeting(1, { transcript: [entry('00:00:01', 'price only'), entry('00:00:02', 'price and renewal')] });
+    assert.match(transcriptSnippets(m, ['price', 'renewal'])[0], /price and renewal/);
   });
 });

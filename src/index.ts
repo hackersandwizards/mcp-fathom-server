@@ -1,29 +1,14 @@
 #!/usr/bin/env node
-
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import dotenv from "dotenv";
-import { createServer } from "./server.js";
-
-dotenv.config();
+import { serveStdio } from '@modelcontextprotocol/server/stdio';
+import { FathomClient } from './fathom.js';
+import { createServer } from './server.js';
 
 const apiKey = process.env.FATHOM_API_KEY;
 if (!apiKey) {
-  console.error("Error: FATHOM_API_KEY environment variable is required");
-  console.error("Please set it in your environment variables or Claude Desktop config");
-  console.error("See README.md for setup instructions");
+  console.error('FATHOM_API_KEY is not set. Put it in the env block of your MCP client config, see README.md.');
   process.exit(1);
 }
 
-async function main() {
-  const server = createServer(apiKey as string);
-  const transport = new StdioServerTransport();
-
-  await server.connect(transport);
-  console.error("Fathom MCP Server started successfully");
-  console.error("Connected to Fathom API");
-}
-
-main().catch((error) => {
-  console.error("Fatal error:", error);
-  process.exit(1);
-});
+const client = new FathomClient(apiKey);
+serveStdio(() => createServer(client));
+console.error('Fathom MCP server running on stdio');

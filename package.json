@@ -1,32 +1,41 @@
 {
   "name": "@petesena/mcp-fathom-server",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "MCP server for Fathom AI meeting API integration",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
     "mcp-fathom-server": "./dist/index.js"
   },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
-    "test": "npx @modelcontextprotocol/inspector dist/index.js",
-    "test:unit": "node --import tsx/esm --test tests/*.test.ts"
+    "dev": "node --env-file=.env --import tsx src/index.ts",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "inspect": "npx @modelcontextprotocol/inspector node --env-file=.env dist/index.js"
   },
-  "keywords": ["mcp", "fathom", "meetings", "ai"],
+  "keywords": [
+    "mcp",
+    "fathom",
+    "meetings",
+    "ai"
+  ],
   "author": "petesena",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.1",
-    "axios": "^1.7.2",
-    "dotenv": "^16.4.5",
-    "zod": "^3.23.8",
-    "zod-to-json-schema": "^3.23.2"
+    "@modelcontextprotocol/server": "^2.1.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/node": "^20.14.10",
-    "tsx": "^4.16.2",
-    "typescript": "^5.5.3"
+    "@modelcontextprotocol/client": "^2.1.0",
+    "@types/node": "^20.19.43",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
   }
 }
