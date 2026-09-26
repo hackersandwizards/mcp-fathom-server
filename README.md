@@ -33,13 +33,13 @@ Every read tool is marked read-only, so clients can run it without asking. `dele
 
 ## Setup
 
-You need Node.js 20 or later and a Fathom API key from the API Access section of your [Fathom user settings](https://fathom.video/customize#api-access-header).
+You need Node.js 20 or later to run the server, [Bun](https://bun.sh) 1.4.2 or later to install and build it, and a Fathom API key from the API Access section of your [Fathom user settings](https://fathom.video/customize#api-access-header).
 
 ```bash
 git clone https://github.com/hackersandwizards/mcp-fathom-server.git
 cd mcp-fathom-server
-npm install
-npm run build
+bun install
+bun run build
 ```
 
 Claude Code:
@@ -65,12 +65,12 @@ Claude Desktop: add this to `~/Library/Application Support/Claude/claude_desktop
 ## Development
 
 ```bash
-npm test          # unit and in-process MCP tests, no network
-npm run dev       # runs from source, reads FATHOM_API_KEY from .env
-npm run inspect   # MCP Inspector against the build
+bun run check     # typecheck plus unit and in-process MCP tests, no network
+bun run dev       # runs from source with Bun, which reads FATHOM_API_KEY from .env
+bun run inspect   # MCP Inspector against the build
 ```
 
-Copy `.env.example` to `.env` for `npm run dev`. The server itself reads only its environment, never a `.env` file, so a project's `.env` cannot change it. In the Inspector, set `FATHOM_API_KEY` under Environment Variables.
+Copy `.env.example` to `.env` for `bun run dev`. The server itself reads only its environment, never a `.env` file, so a project's `.env` cannot change it. In the Inspector, set `FATHOM_API_KEY` under Environment Variables.
 
 ## License
 
