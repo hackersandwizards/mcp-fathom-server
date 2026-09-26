@@ -4,7 +4,7 @@ import { mkdtemp, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
-import { MeetingIndex } from '../src/meeting-index.js';
+import { MeetingIndex, peopleOf } from '../src/meeting-index.js';
 import { createServer } from '../src/server.js';
 import { fakeApi, meeting, pagedMeetings } from './helpers.js';
 
@@ -27,6 +27,7 @@ async function built(meetings = history()) {
   });
   const path = join(await mkdtemp(join(tmpdir(), 'fathom-index-')), 'index.json');
   const index = new MeetingIndex(api.client, path, async () => {});
+  await index.lock();
   await index.backfill();
   return { index, path, live, calls: api.calls, client: api.client };
 }
@@ -82,14 +83,88 @@ describe('MeetingIndex', () => {
     const pages = pagedMeetings(meetings);
     const { client, calls } = fakeApi(url => (failing && url.searchParams.get('cursor') ? new Response('', { status: 401 }) : pages(url)));
     const first = new MeetingIndex(client, path, async () => {});
+    await first.lock();
     await first.backfill();
     assert.equal(first.size, 10);
     failing = false;
     const second = new MeetingIndex(client, path, async () => {});
     await second.load();
+    await second.lock();
     const before = calls.length;
     await second.backfill();
     assert.equal(second.size, 25);
     assert.equal(calls.length - before, 2, 'continues from page 2, not from the start');
+  });
+
+  it('merges an invitee who spoke into one person', () => {
+    const m = meeting(1, {
+      calendar_invitees: [{ name: 'Alice Smith', email: 'alice@x.com', email_domain: 'x.com', is_external: true, matched_speaker_display_name: 'Alice S.' }],
+      transcript: [speaker('Alice S.'), speaker('Bob')]
+    });
+    assert.deepEqual(peopleOf(m), [
+      { name: 'Alice Smith', email: 'alice@x.com', external: true, invited: true, spoke: true },
+      { name: 'Bob', email: null, external: null, invited: false, spoke: true }
+    ]);
+  });
+
+  it('keeps the watermark when a refresh fails halfway, so no meeting is skipped', async () => {
+    const meetings = history();
+    const pages = pagedMeetings(meetings);
+    const newer = [meeting(101, { created_at: '2026-02-02T10:00:00Z' }), meeting(100, { created_at: '2026-02-01T10:00:00Z' })];
+    let failSecondPage = false;
+    const { client } = fakeApi(url => {
+      if (!url.searchParams.get('created_after')) return pages(url);
+      if (!url.searchParams.get('cursor')) return { items: [newer[0]], next_cursor: 'p2' };
+      return failSecondPage ? new Response('', { status: 401 }) : { items: [newer[1]], next_cursor: null };
+    });
+    const path = join(await mkdtemp(join(tmpdir(), 'fathom-index-')), 'index.json');
+    const index = new MeetingIndex(client, path, async () => {});
+    await index.lock();
+    await index.backfill();
+    failSecondPage = true;
+    await assert.rejects(index.refresh());
+    failSecondPage = false;
+    await index.refresh();
+    assert.equal(index.findByLink('/calls/100')?.recording_id, 100);
+  });
+
+  it('restarts a backfill whose saved cursor Fathom rejects', async () => {
+    const meetings = history();
+    const path = join(await mkdtemp(join(tmpdir(), 'fathom-index-')), 'index.json');
+    const pages = pagedMeetings(meetings);
+    const { client } = fakeApi(url => (url.searchParams.get('cursor')?.includes('stale') ? new Response('{"message":"bad cursor"}', { status: 400 }) : pages(url)));
+    const index = new MeetingIndex(client, path, async () => {});
+    await index.lock();
+    (index as unknown as { state: { backfill_cursor: string } }).state.backfill_cursor = '0..stale';
+    await index.backfill();
+    assert.equal(index.size, 25);
+  });
+
+  it('lets only the lock holder write', async () => {
+    const { path } = await built();
+    const other = new MeetingIndex(fakeApi(() => ({})).client, path);
+    const lockPath = `${path}.lock`;
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(lockPath, String(process.ppid));
+    assert.equal(await other.lock(), false);
+  });
+
+  it('falls back to scanning meetings older than a partial index', async () => {
+    const meetings = history();
+    const pages = pagedMeetings(meetings);
+    const api = fakeApi(url => {
+      if (url.searchParams.get('created_after')) return { items: [], next_cursor: null };
+      const before = url.searchParams.get('created_before');
+      return before ? { items: meetings.filter(m => m.created_at < before), next_cursor: null } : pages(url);
+    });
+    const path = join(await mkdtemp(join(tmpdir(), 'fathom-index-')), 'index.json');
+    const index = new MeetingIndex(api.client, path, async () => {});
+    await index.lock();
+    index.stop();
+    (index as unknown as { add: (m: unknown[]) => void }).add(meetings.slice(0, 10));
+    (index as unknown as { state: { newest_created_at: string } }).state.newest_created_at = meetings[0].created_at;
+    const mcp = await connect(api.client, index);
+    assert.equal(body(await mcp.callTool({ name: 'find_meeting_by_link', arguments: { link: '/share/s20' } })).recording_id, 20);
+    assert.ok(api.calls.some(c => c.url.searchParams.get('created_before') === meetings[9].created_at));
   });
 });

@@ -2,7 +2,7 @@ import { createRequire } from 'node:module';
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
 import { FathomClient, type Meeting, type MeetingFilters, type TranscriptEntry } from './fathom.js';
-import { type IndexedMeeting, type MeetingIndex, toIndexed } from './meeting-index.js';
+import { type IndexedMeeting, linkPath, type MeetingIndex, toIndexed } from './meeting-index.js';
 import {
   DATE_RANGES,
   anyIncludes,
@@ -88,19 +88,6 @@ function resourceId(value: string | string[]): number {
   const id = Number(value);
   if (!Number.isInteger(id) || id <= 0) throw new Error(`Invalid recording_id: ${value}`);
   return id;
-}
-
-/** The /calls/<id> or /share/... path of a fathom.video URL, or null. */
-function linkPath(value: string | null | undefined): string | null {
-  try {
-    const raw = value ?? '';
-    const url = new URL(/^[a-z]+:\/\//i.test(raw) ? raw : raw.startsWith('/') ? `https://fathom.video${raw}` : `https://${raw}`);
-    if (!/(^|\.)fathom\.video$/.test(url.hostname)) return null;
-    const path = url.pathname.replace(/\/+$/, '');
-    return /^\/(calls|share)\//.test(path) ? path : null;
-  } catch {
-    return null;
-  }
 }
 
 function peopleKey(email: string | null, name: string | null): string {
@@ -240,17 +227,24 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
       const path = /^\d+$/.test(link) ? `/calls/${link}` : linkPath(link);
       if (!path) return fail('Not a fathom.video /calls/ or /share/ link or a numeric call ID.');
       const matches = (m: { url: string; share_url: string }) => linkPath(m.url) === path || linkPath(m.share_url) === path;
+      const deadline = Date.now() + SCAN_BUDGET_MS;
 
+      let scanFilters: MeetingFilters = {};
       if (index?.size) {
-        await index.refresh().catch(error => console.error(`[index] Refresh failed: ${error.message}`));
-        const hit = index.meetings().find(matches);
+        const refreshed = await index.refresh(deadline).then(
+          () => true,
+          error => (console.error(`[index] Refresh failed: ${error.message}`), false)
+        );
+        const hit = index.findByLink(path);
         if (hit) return json({ recording_id: hit.recording_id, title: hit.title, date: hit.date, url: hit.share_url || hit.url });
-        if (index.coverage().complete) return fail('No meeting with this link is visible to this API key.');
+        const { complete, oldest_indexed } = index.coverage();
+        if (refreshed && complete) return fail('No meeting with this link is visible to this API key.');
+        // The index already checked everything newer than its oldest meeting, unless the refresh failed.
+        if (refreshed && oldest_indexed) scanFilters = { created_before: oldest_indexed };
       }
 
-      const deadline = Date.now() + SCAN_BUDGET_MS;
       let found: Meeting | undefined;
-      const scan = await client.listMeetings({}, max_scan, undefined, meeting => {
+      const scan = await client.listMeetings(scanFilters, max_scan, undefined, meeting => {
         if (matches(meeting)) found = meeting;
         return !!found || Date.now() > deadline;
       });
@@ -360,10 +354,14 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
 
       let meetings: IndexedMeeting[];
       let coverage: Record<string, unknown>;
-      if (index?.size) {
-        await index.refresh().catch(error => console.error(`[index] Refresh failed: ${error.message}`));
+      // A partial index smaller than the requested scan would search fewer meetings than the scan.
+      if (index && (index.coverage().complete || index.size >= max_scan)) {
+        const refreshError = await index.refresh(deadline).then(
+          () => undefined,
+          (error: Error) => error.message
+        );
         meetings = index.meetings();
-        coverage = { index: index.coverage() };
+        coverage = { index: index.coverage(), ...(refreshError ? { index_warning: `Newest meetings may be missing: ${refreshError}` } : {}) };
       } else {
         const scan = await client
           .listMeetings({}, max_scan, undefined, () => Date.now() > deadline)
