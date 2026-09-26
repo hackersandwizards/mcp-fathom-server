@@ -1,5 +1,7 @@
 # MCP Fathom Server
 
+Archived on 2026-09-26. The company OS now uses Fathom's hosted MCP at `https://api.fathom.ai/mcp`, plus one read-only listing script in its `fathom-api` skill for share links, times and invitee emails.
+
 A local MCP server for the [Fathom](https://fathom.video) meeting recorder. It runs over stdio and reads the Fathom API with your personal API key.
 
 Fathom also runs a hosted MCP server at `https://api.fathom.ai/mcp` with OAuth sign-in. Compared on 2026-09-26, it returns only `fathom.video/calls/` links that need a Fathom login, never share links, and it cannot manage webhooks. It does search speakers and resolve links across the whole history, where this server scans recent meetings. Both servers can run side by side: find an older meeting with the hosted one, then get its share link here with `list_meetings` and the meeting's date.
