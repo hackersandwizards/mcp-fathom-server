@@ -143,6 +143,7 @@ export class MeetingIndex {
   private loadedMtime = 0;
   private pagesSinceSave = 0;
   private freshAt = 0;
+  private walkFromTop = false;
   private missAt = 0;
   private cursorRejections = 0;
   private exitHooked = false;
@@ -159,7 +160,9 @@ export class MeetingIndex {
     return `${this.path}.lock`;
   }
 
+  /** Reads the file when it changed. The writer owns the file and never reloads it. */
   async load(): Promise<void> {
+    if (this.writer) return;
     try {
       const { mtimeMs } = await stat(this.path);
       if (mtimeMs === this.loadedMtime) return;
@@ -237,13 +240,18 @@ export class MeetingIndex {
     return next;
   }
 
-  private add(meetings: Meeting[]): void {
+  /** `withTranscripts`: the listing asked for transcripts, so a missing one is retried next walk. */
+  private add(meetings: Meeting[], withTranscripts: boolean): void {
     const walk = this.state.walk ?? 0;
     for (const m of meetings) {
       const indexed = { ...toIndexed(m), walk };
       // A listing without transcripts keeps the speakers found earlier.
       const known = this.state.meetings[m.recording_id];
-      if (!m.transcript && known) indexed.people = known.people;
+      if (!m.transcript && known) {
+        indexed.people = known.people;
+        if (known.speakers_missing) indexed.speakers_missing = true;
+      }
+      if ((withTranscripts || !known) && !m.transcript) indexed.speakers_missing = true;
       this.state.meetings[m.recording_id] = indexed;
     }
     if (meetings.length) this.sorted = this.byLink = null;
@@ -273,26 +281,30 @@ export class MeetingIndex {
   private async walkPage(): Promise<void> {
     await this.heartbeat();
     if (!this.writer) return;
-    // A re-walk only learns which meetings exist, so it skips transcripts except for new meetings.
+    const cursor = this.state.backfill_cursor ?? undefined;
+    if (!cursor) this.walkFromTop = true;
+    // A re-walk only learns which meetings exist. It re-reads a page with transcripts only when the
+    // page holds a new meeting or one whose speakers are missing, like one page of the first build.
     const rewalk = this.state.complete;
-    const page = await this.client.listMeetings({ include_transcript: !rewalk }, 10, this.state.backfill_cursor ?? undefined);
-    const failed: number[] = [];
-    if (rewalk) {
-      for (const m of page.items) {
-        const known = this.state.meetings[m.recording_id];
-        if (known && !known.speakers_missing) continue;
-        // A transcript that cannot be read leaves the invitees, rather than stalling the walk on this page.
-        m.transcript = await this.client.getTranscript(m.recording_id).catch(() => (failed.push(m.recording_id), []));
-      }
+    const page = await this.client.listMeetings({ include_transcript: !rewalk }, 10, cursor);
+    this.add(page.items, !rewalk);
+    if (rewalk && page.items.some(m => this.state.meetings[m.recording_id]?.speakers_missing)) {
+      const full = await this.client.listMeetings({ include_transcript: true }, 10, cursor).catch(() => null);
+      if (full) this.add(full.items, true);
     }
-    this.add(page.items);
-    for (const id of failed) this.state.meetings[id].speakers_missing = true;
-    if (!this.state.backfill_cursor && page.items[0]) this.raiseWatermark(page.items[0].created_at);
+    if (!cursor && page.items[0]) this.raiseWatermark(page.items[0].created_at);
     this.state.backfill_cursor = page.next_cursor;
     if (!page.next_cursor) {
-      // Every visible meeting was seen during this walk; the rest were deleted or unshared.
       const walk = this.state.walk ?? 0;
-      for (const [id, m] of Object.entries(this.state.meetings)) if ((m.walk ?? 0) < walk) delete this.state.meetings[id];
+      const stale = Object.entries(this.state.meetings).filter(([, m]) => (m.walk ?? 0) < walk);
+      // A walk resumed from a saved cursor that ends early, as an expired cursor might, would delete
+      // most of the index. Such a walk starts again from the top instead.
+      if (!this.walkFromTop && stale.length > this.size / 2) {
+        this.startWalk();
+        return this.save();
+      }
+      // Every visible meeting was seen during this walk; the rest were deleted or unshared.
+      for (const [id] of stale) delete this.state.meetings[id];
       this.sorted = this.byLink = null;
       this.state.walking = false;
       this.state.complete = true;
@@ -314,15 +326,16 @@ export class MeetingIndex {
     const since = newest && new Date(Date.parse(newest) - overlapMs).toISOString();
     const page = await this.client.listMeetings({ created_after: since || undefined, include_transcript: true }, Infinity, undefined, () => Date.now() > deadline);
     const added = page.items.some(m => !this.state.meetings[m.recording_id]);
-    this.add(page.items);
+    this.add(page.items, true);
     if (page.error || page.next_cursor) {
       await this.save();
       throw new FathomApiError(page.error ?? 'Stopped at the time limit.', page.status);
     }
     for (const m of page.items) this.raiseWatermark(m.created_at);
     this.freshAt = Date.now();
+    // Only the writer's loop reads this time, so it is saved with the next change rather than alone.
     if (background) this.state.forward_synced_at = new Date().toISOString();
-    if (background || added) await this.save();
+    if (added) await this.save();
   }
 
   private handleLoopError(error: unknown): 'stop' | 'continue' {
@@ -373,17 +386,23 @@ export class MeetingIndex {
         }
         if (this.state.complete && !this.state.walking && age(this.state.completed_at) > REWALK_AFTER_MS) this.startWalk();
         if (!this.state.complete || this.state.walking) {
-          if (!(await this.backfill())) return;
+          if (!(await this.backfill())) return this.resign();
           if (!this.state.complete || this.state.walking) continue;
           console.error(`[index] Complete: ${this.size} meetings`);
         }
         if (age(this.state.forward_synced_at) > FORWARD_EVERY_MS) await this.serial(() => this.forward(Infinity, REFRESH_OVERLAP_MS, true));
         await this.sleep(IDLE_MS);
       } catch (error) {
-        if (this.handleLoopError(error) === 'stop') return;
+        if (this.handleLoopError(error) === 'stop') return this.resign();
         await this.sleep(ERROR_PAUSE_MS);
       }
     }
+  }
+
+  /** Gives the lock up when the loop stops for good, so another session can maintain the index. */
+  private resign(): void {
+    this.writer = false;
+    this.releaseLock();
   }
 
   /**

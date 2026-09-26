@@ -11,7 +11,7 @@ import { fakeApi, meeting, pagedMeetings } from './helpers.js';
 const speaker = (name: string, text = 'hi') => ({ speaker: { display_name: name, matched_calendar_invitee_email: null }, text, timestamp: '00:00:01' });
 
 function history() {
-  const meetings = Array.from({ length: 25 }, (_, i) => meeting(i + 1, { created_at: `2026-01-${String(30 - i).padStart(2, '0')}T10:00:00Z` }));
+  const meetings = Array.from({ length: 25 }, (_, i) => meeting(i + 1, { created_at: `2026-01-${String(30 - i).padStart(2, '0')}T10:00:00Z`, transcript: [] }));
   // An old meeting where Rita only spoke, without being on the invite.
   meetings[24].transcript = [speaker('Rita Speaker')];
   return meetings;
@@ -22,10 +22,11 @@ async function built(meetings = history()) {
   const pages = pagedMeetings(live);
   const api = fakeApi(url => {
     if (url.pathname.endsWith('/team_members')) return { items: [], next_cursor: null };
-    if (url.pathname.endsWith('/300/transcript')) return new Response('', { status: 404 });
-    if (url.pathname.endsWith('/transcript')) return { transcript: [speaker('Late Speaker')] };
     const after = url.searchParams.get('created_after');
-    return after ? { items: live.filter(m => m.created_at > after), next_cursor: null } : pages(url);
+    const page = after ? { items: live.filter(m => m.created_at > after), next_cursor: null } : pages(url);
+    // Like Fathom, a listing carries transcripts only when asked for them.
+    if (url.searchParams.get('include_transcript') === 'true') return page;
+    return { ...page, items: page.items.map(({ transcript: _, ...m }) => m) };
   });
   const path = join(await mkdtemp(join(tmpdir(), 'fathom-index-')), 'index.json');
   const index = new MeetingIndex(api.client, path, async () => {});
@@ -172,14 +173,13 @@ describe('MeetingIndex', () => {
   it('re-walks without transcripts, adding shared meetings and dropping deleted ones', async () => {
     const { index, live, calls, client } = await built();
     live.splice(3, 1);
-    live.splice(10, 0, meeting(200, { created_at: '2026-01-19T12:00:00Z' }));
+    live.splice(10, 0, meeting(200, { created_at: '2026-01-19T12:00:00Z', transcript: [speaker('Late Speaker')] }));
     (index as unknown as { startWalk: () => void }).startWalk();
     assert.equal(index.coverage().complete, true, 'the old index stays usable');
     const before = calls.length;
     await index.backfill();
     const walked = calls.slice(before);
-    assert.ok(walked.every(c => c.url.searchParams.get('include_transcript') !== 'true'));
-    assert.deepEqual(walked.filter(c => c.url.pathname.endsWith('/transcript')).map(c => c.url.pathname), ['/external/v1/recordings/200/transcript']);
+    assert.equal(walked.filter(c => c.url.searchParams.get('include_transcript') === 'true').length, 1, 'only the page with the new meeting is re-read with transcripts');
     assert.equal(index.size, 25);
     assert.equal(index.findByLink('/calls/4'), undefined);
     const mcp = await connect(client, index);
@@ -201,9 +201,11 @@ describe('MeetingIndex', () => {
       if (!url.searchParams.get('created_after')) return pages(url);
       return url.searchParams.get('cursor') ? new Response('', { status: 401 }) : { items: [meeting(101, { created_at: '2026-02-02T10:00:00Z' })], next_cursor: 'p2' };
     });
-    const index = new MeetingIndex(client, join(await mkdtemp(join(tmpdir(), 'fathom-index-')), 'index.json'), async () => {});
+    const path = join(await mkdtemp(join(tmpdir(), 'fathom-index-')), 'index.json');
+    const index = new MeetingIndex(client, path, async () => {});
     await index.run();
     assert.equal(index.coverage().complete, true);
+    await assert.rejects(stat(`${path}.lock`), 'the stopped writer gives the lock up');
   });
 
   it('tops up a partial index with a scan of older meetings only', async () => {
@@ -296,7 +298,7 @@ describe('MeetingIndex', () => {
 
   it('finishes a re-walk when a new meeting has no readable transcript, and retries it next walk', async () => {
     const { index, live, calls } = await built();
-    live.splice(5, 0, meeting(300, { created_at: '2026-01-24T12:00:00Z' }));
+    live.splice(5, 0, meeting(300, { created_at: '2026-01-24T12:00:00Z', transcript: null as never }));
     (index as unknown as { startWalk: () => void }).startWalk();
     await index.backfill();
     assert.equal(index.findByLink('/calls/300')?.recording_id, 300);
@@ -304,7 +306,7 @@ describe('MeetingIndex', () => {
     const before = calls.length;
     (index as unknown as { startWalk: () => void }).startWalk();
     await index.backfill();
-    assert.equal(calls.slice(before).filter(c => c.url.pathname.endsWith('/transcript')).length, 1, 'only the missing transcript is retried');
+    assert.equal(calls.slice(before).filter(c => c.url.searchParams.get('include_transcript') === 'true').length, 1, 'only the page with the missing transcript is re-read');
   });
 
   it('does not rewrite the file when a sync finds only known meetings', async () => {
@@ -349,5 +351,34 @@ describe('MeetingIndex', () => {
     assert.equal(matches[0].email, 'anna@x.com');
     assert.equal(matches[0].meetings, 2);
     assert.equal(matches[0].latest_meeting.recording_id, 2);
+  });
+
+  it('keeps the index when a resumed walk ends early, and walks again from the top', async () => {
+    // The fake serves page p9 as an empty last page, as an expired cursor might.
+    const { path, client } = await built();
+    const saved = JSON.parse(await readFile(path, 'utf8'));
+    await writeFile(path, JSON.stringify({ ...saved, walking: true, walk: 1, backfill_cursor: '0..p9' }));
+    const resumed = new MeetingIndex(client, path, async () => {});
+    await resumed.load();
+    await resumed.lock();
+    await resumed.backfill();
+    assert.equal(resumed.size, 25);
+  });
+
+  it('counts a meeting once when two of its entries are the same person', async () => {
+    const m = meeting(1, {
+      transcript: [speaker('Ben')],
+      calendar_invitees: [{ name: 'Benedikt S', email: 'b@x.com', email_domain: 'x.com', is_external: false, matched_speaker_display_name: null }]
+    });
+    const linked = meeting(2, {
+      created_at: '2025-12-01T10:00:00Z',
+      calendar_invitees: [{ name: 'Benedikt S', email: 'b@x.com', email_domain: 'x.com', is_external: false, matched_speaker_display_name: 'Ben' }]
+    });
+    const { index, client } = await built([m, linked]);
+    const mcp = await connect(client, index);
+    const { matches } = body(await mcp.callTool({ name: 'find_person', arguments: { name: 'ben', max_scan: 10 } }));
+    assert.equal(matches.length, 1);
+    assert.equal(matches[0].meetings, 2);
+    assert.equal(matches[0].spoke_in, 1);
   });
 });

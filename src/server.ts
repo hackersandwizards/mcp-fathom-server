@@ -406,13 +406,18 @@ export function createServer(client: FathomClient, index?: MeetingIndex): McpSer
 
       const people = new Map<string, Record<string, unknown> & { meetings: number; spoke_in: number }>();
       for (const m of members) people.set(keyOf(m.email, m.name), { name: m.name, email: m.email, team_member: true, meetings: 0, spoke_in: 0 });
+      // Two entries of one meeting can resolve to the same person, so each meeting counts once.
+      const counted = new Map<string, { id: number; spoke: boolean }>();
       for (const { meeting, p } of seen) {
         const key = keyOf(p.email, p.name);
         const person = people.get(key) ?? { name: p.name, email: p.email, meetings: 0, spoke_in: 0 };
         person.email ||= p.email;
         person.external ??= p.external ?? undefined;
-        person.meetings += 1;
-        if (p.spoke) person.spoke_in += 1;
+        const last = counted.get(key);
+        const again = last?.id === meeting.recording_id;
+        if (!again) person.meetings += 1;
+        if (p.spoke && !(again && last.spoke)) person.spoke_in += 1;
+        counted.set(key, { id: meeting.recording_id, spoke: p.spoke || (again && last.spoke) });
         person.latest_meeting ??= { recording_id: meeting.recording_id, title: meeting.title, date: meeting.date, url: meetingUrl(meeting) };
         people.set(key, person);
       }
