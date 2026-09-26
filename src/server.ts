@@ -2,6 +2,7 @@ import { createRequire } from 'node:module';
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
 import { FathomClient, type Meeting, type MeetingFilters, type TranscriptEntry } from './fathom.js';
+import { type IndexedMeeting, type MeetingIndex, toIndexed } from './meeting-index.js';
 import {
   DATE_RANGES,
   anyIncludes,
@@ -11,7 +12,6 @@ import {
   formatTranscriptLine,
   matchMeeting,
   inviteeMatches,
-  meetingDate,
   queryWords,
   transcriptSnippets
 } from './format.js';
@@ -107,7 +107,7 @@ function peopleKey(email: string | null, name: string | null): string {
   return (email || name || '').toLowerCase();
 }
 
-export function createServer(client: FathomClient): McpServer {
+export function createServer(client: FathomClient, index?: MeetingIndex): McpServer {
   const server = new McpServer({ name: 'mcp-fathom-server', version }, { instructions: INSTRUCTIONS });
 
   // Paging through one transcript with `start` would otherwise re-download it for every page,
@@ -229,20 +229,29 @@ export function createServer(client: FathomClient): McpServer {
     {
       title: 'Find meeting by link',
       description:
-        'Resolve a pasted Fathom link (fathom.video/calls/<id> or fathom.video/share/<token>) or a bare call ID to its meeting, including recording_id and the public share URL. The API has no lookup, so this scans recent meetings newest first.',
+        'Resolve a pasted Fathom link (fathom.video/calls/<id> or fathom.video/share/<token>) or a bare call ID to its meeting, including recording_id and the public share URL. Looks it up in the local meeting index, or scans recent meetings when the index is off or incomplete.',
       inputSchema: z.object({
         link: z.string().trim().min(1).describe('A fathom.video/calls/ or /share/ URL, or the numeric call ID from a /calls/ URL'),
-        max_scan: z.number().int().min(10).max(500).default(200).describe('Recent meetings to scan')
+        max_scan: z.number().int().min(10).max(500).default(200).describe('Recent meetings to scan when the index cannot answer')
       }),
       annotations: READ
     },
     async ({ link, max_scan }) => {
       const path = /^\d+$/.test(link) ? `/calls/${link}` : linkPath(link);
       if (!path) return fail('Not a fathom.video /calls/ or /share/ link or a numeric call ID.');
+      const matches = (m: { url: string; share_url: string }) => linkPath(m.url) === path || linkPath(m.share_url) === path;
+
+      if (index?.size) {
+        await index.refresh().catch(error => console.error(`[index] Refresh failed: ${error.message}`));
+        const hit = index.meetings().find(matches);
+        if (hit) return json({ recording_id: hit.recording_id, title: hit.title, date: hit.date, url: hit.share_url || hit.url });
+        if (index.coverage().complete) return fail('No meeting with this link is visible to this API key.');
+      }
+
       const deadline = Date.now() + SCAN_BUDGET_MS;
       let found: Meeting | undefined;
       const scan = await client.listMeetings({}, max_scan, undefined, meeting => {
-        if (linkPath(meeting.url) === path || linkPath(meeting.share_url) === path) found = meeting;
+        if (matches(meeting)) found = meeting;
         return !!found || Date.now() > deadline;
       });
       if (found) return json(formatMeeting(found, { detailed: true }));
@@ -334,55 +343,59 @@ export function createServer(client: FathomClient): McpServer {
     {
       title: 'Find person',
       description:
-        "Find people by name or email fragment in the team roster and among calendar invitees of recent meetings. Returns email, whether they are external, and their latest meeting. People who only spoke in a meeting without being invited are not found.",
+        'Find people by name or email fragment among meeting speakers, calendar invitees and the team roster. Returns email, whether they are external, how many meetings they joined or spoke in, and their latest meeting with its share URL. Searches the local meeting index (whole history) when it is enabled, otherwise the most recent meetings.',
       inputSchema: z.object({
         name: z.string().trim().toLowerCase().min(1).describe('Name or email fragment, case-insensitive'),
-        max_scan: z.number().int().min(10).max(500).default(100).describe('Recent meetings to scan for invitees')
+        max_scan: z.number().int().min(10).max(500).default(100).describe('Recent meetings to scan when the index is off or still empty')
       }),
       annotations: READ
     },
     async ({ name, max_scan }) => {
       const deadline = Date.now() + SCAN_BUDGET_MS;
       let rosterError: string | undefined;
-      let scanError: string | undefined;
-      const [members, scan] = await Promise.all([
-        client.listTeamMembers(undefined, deadline).catch((error: Error) => {
-          rosterError = error.message;
-          return [];
-        }),
-        client.listMeetings({}, max_scan, undefined, () => Date.now() > deadline).catch((error: Error) => {
-          scanError = error.message;
-          return { items: [] as Meeting[], error: undefined };
-        })
-      ]);
+      const roster = client.listTeamMembers(undefined, deadline).catch((error: Error) => {
+        rosterError = error.message;
+        return [];
+      });
 
-      const people = new Map<string, Record<string, unknown> & { meetings: number }>();
-      for (const m of members) {
+      let meetings: IndexedMeeting[];
+      let coverage: Record<string, unknown>;
+      if (index?.size) {
+        await index.refresh().catch(error => console.error(`[index] Refresh failed: ${error.message}`));
+        meetings = index.meetings();
+        coverage = { index: index.coverage() };
+      } else {
+        const scan = await client
+          .listMeetings({}, max_scan, undefined, () => Date.now() > deadline)
+          .catch((error: Error) => ({ items: [] as Meeting[], error: error.message }));
+        meetings = scan.items.map(toIndexed);
+        coverage = { scanned_meetings: scan.items.length, ...(scan.error ? { error: `Meeting scan stopped early: ${scan.error}` } : {}) };
+      }
+
+      const people = new Map<string, Record<string, unknown> & { meetings: number; spoke_in: number }>();
+      for (const m of await roster) {
         if (anyIncludes([m.name, m.email], name)) {
-          people.set(peopleKey(m.email, m.name), { name: m.name, email: m.email, source: 'team', meetings: 0 });
+          people.set(peopleKey(m.email, m.name), { name: m.name, email: m.email, team_member: true, meetings: 0, spoke_in: 0 });
         }
       }
-      for (const meeting of scan.items) {
-        for (const invitee of meeting.calendar_invitees ?? []) {
-          if (!inviteeMatches(invitee, name)) continue;
-          const key = peopleKey(invitee.email, invitee.name || invitee.matched_speaker_display_name);
-          const person = people.get(key) ?? {
-            name: invitee.name || invitee.matched_speaker_display_name,
-            email: invitee.email,
-            source: 'invitee',
-            meetings: 0
-          };
-          person.external ??= invitee.is_external;
+      // Newest first, so the first meeting seen for a person is their latest.
+      for (const meeting of meetings) {
+        for (const p of meeting.people) {
+          if (!anyIncludes([p.name, p.email], name)) continue;
+          const key = peopleKey(p.email, p.name);
+          const person = people.get(key) ?? { name: p.name, email: p.email, meetings: 0, spoke_in: 0 };
+          person.external ??= p.external ?? undefined;
           person.meetings += 1;
-          // Meetings arrive newest first, so the first one seen is the latest.
-          person.latest_meeting ??= { recording_id: meeting.recording_id, title: meeting.title, date: meetingDate(meeting) };
+          if (p.spoke) person.spoke_in += 1;
+          person.latest_meeting ??= { recording_id: meeting.recording_id, title: meeting.title, date: meeting.date, url: meeting.share_url || meeting.url };
           people.set(key, person);
         }
       }
+      const matches = [...people.values()].sort((a, b) => b.meetings - a.meetings);
       return json({
-        matches: [...people.values()],
-        scanned_meetings: scan.items.length,
-        ...(scan.error || scanError ? { error: `Meeting scan stopped early: ${scan.error ?? scanError}` } : {}),
+        matches: matches.slice(0, 25),
+        ...(matches.length > 25 ? { note: `${matches.length - 25} more people match. Use a longer name fragment.` } : {}),
+        ...coverage,
         ...(rosterError ? { roster_error: `Team roster not searched: ${rosterError}` } : {})
       });
     }
