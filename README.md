@@ -35,7 +35,7 @@ Every read tool is marked read-only, so clients can run it without asking. `dele
 
 ## Setup
 
-You need Node.js 20 or later to run the server, [Bun](https://bun.sh) 1.4.2 or later to install and build it, and a Fathom API key from the API Access section of your [Fathom user settings](https://fathom.video/customize#api-access-header).
+You need [Bun](https://bun.sh) 1.4.2 or later to install the server, Node.js 20 or later to run a build of it, and a Fathom API key from the API Access section of your [Fathom user settings](https://fathom.video/customize#api-access-header).
 
 ```bash
 git clone https://github.com/hackersandwizards/mcp-fathom-server.git
@@ -44,13 +44,14 @@ bun install
 bun run build
 ```
 
-To install it from a release tag instead, with Bun as the runtime:
+To install it from a release tag instead, with Bun as the runtime and no build:
 
 ```bash
-bun add github:hackersandwizards/mcp-fathom-server#v2.0.2
+bun add github:hackersandwizards/mcp-fathom-server#v2.0.3
+claude mcp add fathom -e FATHOM_API_KEY=your-key -- /absolute/path/to/node_modules/.bin/mcp-fathom-server
 ```
 
-The package then provides the `mcp-fathom-server` command, which runs the TypeScript source with Bun.
+The `mcp-fathom-server` command runs the TypeScript source with Bun. Like the build, it reads `FATHOM_API_KEY` only from its environment and ignores any `.env` file.
 
 Claude Code:
 
