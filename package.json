@@ -1,14 +1,13 @@
 {
   "name": "@hackersandwizards/mcp-fathom-server",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "MCP server for Fathom AI meeting API integration",
   "type": "module",
-  "main": "dist/index.js",
   "bin": {
-    "mcp-fathom-server": "./dist/index.js"
+    "mcp-fathom-server": "./src/index.ts"
   },
   "files": [
-    "dist"
+    "src"
   ],
   "engines": {
     "node": ">=20",

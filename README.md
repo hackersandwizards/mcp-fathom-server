@@ -44,6 +44,14 @@ bun install
 bun run build
 ```
 
+To install it from a release tag instead, with Bun as the runtime:
+
+```bash
+bun add github:hackersandwizards/mcp-fathom-server#v2.0.2
+```
+
+The package then provides the `mcp-fathom-server` command, which runs the TypeScript source with Bun.
+
 Claude Code:
 
 ```bash

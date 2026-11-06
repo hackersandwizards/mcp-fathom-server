@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { FathomClient } from './fathom.js';
 import { createServer } from './server.js';
